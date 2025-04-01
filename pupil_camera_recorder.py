@@ -38,7 +38,7 @@ class CameraMissingError(Exception):
 class UVCSource:
     """Simple UVC camera source implementation."""
     
-    def __init__(self, name=None, uid=None, frame_size=(1280, 720), frame_rate=30):
+    def __init__(self, name=None, uid=None, frame_size=(1280, 720), frame_rate=30, exposure_mode="auto"):
         """
         Initialize a UVC camera source.
         
@@ -47,6 +47,7 @@ class UVCSource:
             uid: Specific camera UID
             frame_size: Desired frame size (width, height)
             frame_rate: Desired frame rate in fps
+            exposure_mode: "auto" or "manual" exposure control
         """
         self.uvc_capture = None
         self._recent_frame = None
@@ -58,6 +59,12 @@ class UVCSource:
         self.uid = uid
         self.frame_size_backup = frame_size
         self.frame_rate_backup = frame_rate
+        self.exposure_mode = exposure_mode
+        
+        # Add backup variables for camera controls
+        self.exposure_time_backup = None
+        self.gamma_backup = None
+        self.saturation_backup = None
         
         # Find and initialize camera
         self.devices = uvc.Device_List()
@@ -142,6 +149,197 @@ class UVCSource:
         # Store settings for reconnection
         self.frame_size_backup = size
         self.frame_rate_backup = rate
+        
+        # Configure camera controls based on camera type
+        controls_dict = {c.display_name: c for c in self.uvc_capture.controls}
+        
+        # First set auto exposure controls for all cameras
+        try:
+            controls_dict["Auto Exposure Priority"].value = 0
+        except KeyError:
+            pass
+        
+        # Set auto exposure mode based on setting
+        try:
+            if self.exposure_mode == "manual":
+                controls_dict["Auto Exposure Mode"].value = 1  # Manual mode
+        except KeyError:
+            pass
+            
+        if "Pupil Cam1" in self.uvc_capture.name:
+            if "ID0" in self.uvc_capture.name or "ID1" in self.uvc_capture.name:
+                # Eye camera settings
+                # Only set exposure time if in manual mode
+                if self.exposure_mode == "manual":
+                    try:
+                        if self.exposure_time_backup is None:
+                            controls_dict["Absolute Exposure Time"].value = 63
+                            self.exposure_time_backup = 63
+                    except KeyError:
+                        pass
+                    
+                try:
+                    if self.gamma_backup is None:
+                        controls_dict["Gamma"].value = 100
+                        self.gamma_backup = 100
+                except KeyError:
+                    pass
+                    
+                try:
+                    if self.saturation_backup is None:
+                        controls_dict["Saturation"].value = 0
+                        self.saturation_backup = 0
+                except KeyError:
+                    pass
+            else:
+                # World camera settings for ID2
+                try:
+                    if self.gamma_backup is None:
+                        controls_dict["Gamma"].value = 100
+                        self.gamma_backup = 100
+                except KeyError:
+                    pass
+                    
+        elif "Pupil Cam2" in self.uvc_capture.name:
+            # Pupil Cam2 settings
+            max_exposure = 32
+            if self.frame_rate == 200:
+                max_exposure = 28
+            elif self.frame_rate == 180:
+                max_exposure = 31
+            
+            # Only set exposure time if in manual mode
+            if self.exposure_mode == "manual":
+                try:
+                    if self.exposure_time_backup is None:
+                        controls_dict["Absolute Exposure Time"].value = max_exposure
+                        self.exposure_time_backup = max_exposure
+                except KeyError:
+                    pass
+                
+            try:
+                if self.gamma_backup is None:
+                    controls_dict["Gamma"].value = 200
+                    self.gamma_backup = 200
+            except KeyError:
+                pass
+                
+            try:
+                if self.saturation_backup is None:
+                    controls_dict["Saturation"].value = 0
+                    self.saturation_backup = 0
+            except KeyError:
+                pass
+    
+    @property
+    def exposure_time(self):
+        """Get current absolute exposure time."""
+        if not self.uvc_capture:
+            return self.exposure_time_backup
+        
+        try:
+            controls_dict = {c.display_name: c for c in self.uvc_capture.controls}
+            return controls_dict["Absolute Exposure Time"].value
+        except KeyError:
+            return None
+
+    @exposure_time.setter
+    def exposure_time(self, value):
+        """Set the exposure time."""
+        if not self.uvc_capture:
+            self.exposure_time_backup = value
+            return
+        
+        try:
+            controls_dict = {c.display_name: c for c in self.uvc_capture.controls}
+            
+            # Only apply if in manual mode
+            if self.exposure_mode == "manual":
+                # Ensure auto exposure is in manual mode
+                try:
+                    controls_dict["Auto Exposure Mode"].value = 1  # Manual mode
+                except KeyError:
+                    pass
+                
+                # Determine the appropriate maximum exposure based on frame rate
+                max_exposure = 32
+                if self.frame_rate >= 200:
+                    max_exposure = 28
+                elif self.frame_rate >= 180:
+                    max_exposure = 31
+                
+                # Constrain value to valid range
+                value = min(max_exposure, max(1, value))
+                
+                # Only set if significantly different from current
+                current_value = controls_dict["Absolute Exposure Time"].value
+                if abs(value - current_value) >= 1:
+                    controls_dict["Absolute Exposure Time"].value = value
+                    self.exposure_time_backup = value
+            else:
+                logger.debug("Camera in auto exposure mode. Manual exposure values ignored.")
+        except KeyError:
+            logger.warning("Could not set exposure time: control not found")
+
+    @property
+    def gamma(self):
+        """Get current gamma value."""
+        if not self.uvc_capture:
+            return self.gamma_backup
+        
+        try:
+            controls_dict = {c.display_name: c for c in self.uvc_capture.controls}
+            return controls_dict["Gamma"].value
+        except KeyError:
+            return None
+
+    @gamma.setter
+    def gamma(self, value):
+        """Set the gamma value."""
+        if not self.uvc_capture:
+            self.gamma_backup = value
+            return
+        
+        try:
+            controls_dict = {c.display_name: c for c in self.uvc_capture.controls}
+            
+            # Only set if significantly different from current
+            current_value = controls_dict["Gamma"].value
+            if abs(value - current_value) >= 1:
+                controls_dict["Gamma"].value = value
+                self.gamma_backup = value
+        except KeyError:
+            logger.warning("Could not set gamma: control not found")
+
+    @property
+    def saturation(self):
+        """Get current saturation value."""
+        if not self.uvc_capture:
+            return self.saturation_backup
+        
+        try:
+            controls_dict = {c.display_name: c for c in self.uvc_capture.controls}
+            return controls_dict["Saturation"].value
+        except KeyError:
+            return None
+
+    @saturation.setter
+    def saturation(self, value):
+        """Set the saturation value."""
+        if not self.uvc_capture:
+            self.saturation_backup = value
+            return
+        
+        try:
+            controls_dict = {c.display_name: c for c in self.uvc_capture.controls}
+            
+            # Only set if significantly different from current
+            current_value = controls_dict["Saturation"].value
+            if abs(value - current_value) >= 1:
+                controls_dict["Saturation"].value = value
+                self.saturation_backup = value
+        except KeyError:
+            logger.warning("Could not set saturation: control not found")
     
     def get_frame(self):
         """
@@ -737,7 +935,7 @@ def list_available_cameras():
     ]
 
 
-def create_eye_tracker(world_name="ID2", eye0_name="ID0", eye1_name="ID1"):
+def create_eye_tracker(world_name="ID2", eye0_name="ID0", eye1_name="ID1", exposure_mode="auto"):
     """
     Create a complete eye tracker setup.
     
@@ -745,14 +943,15 @@ def create_eye_tracker(world_name="ID2", eye0_name="ID0", eye1_name="ID1"):
         world_name: Name pattern for world camera
         eye0_name: Name pattern for eye0 camera
         eye1_name: Name pattern for eye1 camera
+        exposure_mode: "auto" or "manual" exposure control
         
     Returns:
         Dict with cameras and recorder
     """
     # Initialize cameras
-    world_cam = UVCSource(name=world_name, frame_size=(1280, 720), frame_rate=30)
-    eye0_cam = UVCSource(name=eye0_name, frame_size=(192, 192), frame_rate=120)
-    eye1_cam = UVCSource(name=eye1_name, frame_size=(192, 192), frame_rate=120)
+    world_cam = UVCSource(name=world_name, frame_size=(1280, 720), frame_rate=30, exposure_mode=exposure_mode)
+    eye0_cam = UVCSource(name=eye0_name, frame_size=(192, 192), frame_rate=120, exposure_mode=exposure_mode)
+    eye1_cam = UVCSource(name=eye1_name, frame_size=(192, 192), frame_rate=120, exposure_mode=exposure_mode)
     
     # Initialize recorder
     recorder = SimpleRecorder()
