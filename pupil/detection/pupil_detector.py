@@ -259,7 +259,7 @@ class PupilDetector:
     
     def _detect_pupil(self, image):
         """
-        Detect pupil in grayscale eye image.
+        Enhanced pupil detection in grayscale eye image.
         
         Args:
             image: Grayscale eye image
@@ -271,38 +271,73 @@ class PupilDetector:
             if image is None or image.size == 0:
                 return None
             
-            # Apply blur to reduce noise
-            blurred = cv2.GaussianBlur(image, (7, 7), 0)
+            # Apply multiple preprocessing steps
+            # 1. Reduce noise with a gentle blur
+            blurred = cv2.GaussianBlur(image, (5, 5), 0)
             
-            # Apply threshold to get binary image
-            _, binary = cv2.threshold(blurred, self.detection_threshold, 255, cv2.THRESH_BINARY_INV)
+            # 2. Adaptive thresholding to handle varying lighting conditions
+            adaptive_thresh = cv2.adaptiveThreshold(
+                blurred, 
+                255, 
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                cv2.THRESH_BINARY_INV, 
+                11,  # Block size 
+                2    # Constant subtracted from mean
+            )
+            
+            # 3. Morphological operations to clean up the image
+            kernel = np.ones((3,3), np.uint8)
+            cleaned = cv2.morphologyEx(adaptive_thresh, cv2.MORPH_CLOSE, kernel)
+            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
             
             # Find contours
-            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            # Find the largest contour
-            if not contours:
-                return None
+            # Filter and select the best pupil candidate
+            pupil_candidates = []
+            for contour in contours:
+                area = cv2.contourArea(contour)
                 
-            largest_contour = max(contours, key=cv2.contourArea)
+                # Skip very small or very large contours
+                if area < 50 or area > image.size * 0.4:
+                    continue
+                
+                # Compute contour properties
+                (x, y), radius = cv2.minEnclosingCircle(contour)
+                circularity = 4 * np.pi * area / (cv2.arcLength(contour, True) ** 2)
+                
+                # Validate radius and circularity
+                if (self.min_pupil_radius <= radius <= self.max_pupil_radius) and circularity > 0.7:
+                    pupil_candidates.append({
+                        'contour': contour,
+                        'area': area,
+                        'circularity': circularity
+                    })
             
-            # Fit a circle to the contour
-            area = cv2.contourArea(largest_contour)
-            if area < 50:  # Minimum area to consider
+            # If no candidates, return None
+            if not pupil_candidates:
                 return None
-                
-            # Find center and radius using minEnclosingCircle
-            (x, y), radius = cv2.minEnclosingCircle(largest_contour)
+            
+            # Select the best candidate (prioritizing area and circularity)
+            best_candidate = max(pupil_candidates, key=lambda x: (x['area'], x['circularity']))
+            
+            # Compute final pupil properties
+            contour = best_candidate['contour']
+            (x, y), radius = cv2.minEnclosingCircle(contour)
             center = (int(x), int(y))
             radius = int(radius)
             
-            # Validate radius
-            if radius < self.min_pupil_radius or radius > self.max_pupil_radius:
-                return None
+            # Compute area and circularity of the selected contour
+            area = cv2.contourArea(contour)
+            circularity = 4 * np.pi * area / (cv2.arcLength(contour, True) ** 2)
             
-            # Calculate confidence based on circularity
-            circularity = 4 * np.pi * area / (cv2.arcLength(largest_contour, True) ** 2)
-            confidence = circularity * 100  # Scale to percentage
+            # Calculate confidence based on area, circularity, and size
+            confidence = (
+                (area / (np.pi * radius**2)) *  # Fullness of circle
+                circularity *  # Regularity of shape
+                (1 - min(abs(radius - (self.min_pupil_radius + self.max_pupil_radius)/2) / 
+                        ((self.max_pupil_radius - self.min_pupil_radius)/2), 1))  # Size proximity
+            ) * 100  # Scale to percentage
             
             # Return detection result
             return {
@@ -313,9 +348,9 @@ class PupilDetector:
             }
             
         except Exception as e:
-            logger.error(f"Error in pupil detection: {e}")
+            logger.error(f"Error in enhanced pupil detection: {e}")
             return None
-    
+
     def _visualize_detection(self, camera_id, image, detection):
         """
         Visualize pupil detection.

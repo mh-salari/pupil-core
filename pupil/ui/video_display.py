@@ -15,6 +15,7 @@ import numpy as np
 
 from ..service.message_types import MessageType
 from ..utils.timestamp import format_time
+from ..detection.pupil_detector import PupilDetector
 
 # Configure logging
 logging.basicConfig(
@@ -32,7 +33,7 @@ class VideoDisplay:
     Optimized for smooth display performance.
     """
     
-    def __init__(self, server_host="127.0.0.1", server_port=5555, target_fps=30):
+    def __init__(self, server_host="127.0.0.1", server_port=5555, target_fps=30, show_pupils=True):
         """
         Initialize the video display.
         
@@ -40,12 +41,14 @@ class VideoDisplay:
             server_host: Camera service host address
             server_port: Camera service command port
             target_fps: Target frames per second for display
+            show_pupils: Whether to show pupil detection overlays
         """
         self.server_host = server_host
         self.server_port = server_port
         self.client_id = f"video_display_{uuid.uuid4().hex[:8]}"
         self.target_fps = target_fps
         self.target_frame_time = 1.0 / target_fps
+        self.show_pupils = show_pupils
         
         # List of cameras to display
         self.cameras = ["world", "eye0", "eye1"]
@@ -77,6 +80,11 @@ class VideoDisplay:
         # Set socket options for better performance
         self.sub_socket.setsockopt(zmq.RCVTIMEO, 10)  # 10ms timeout
         self.sub_socket.setsockopt(zmq.LINGER, 0)
+        
+        # Initialize pupil detector if needed
+        self.pupil_detector = None
+        if show_pupils:
+            self.pupil_detector = PupilDetector(server_host, server_port)
         
         # Window names
         self.window_names = {
@@ -225,6 +233,10 @@ class VideoDisplay:
             # Store current frame
             self.current_frames[cam_id] = img
             
+            # Overlay pupil detection if enabled
+            if self.show_pupils and self.pupil_detector and self.pupil_detector.is_detecting():
+                self._overlay_pupil_detection(cam_id, img)
+            
             # Display frame
             cv2.imshow(self.window_names[cam_id], img)
             
@@ -241,6 +253,55 @@ class VideoDisplay:
             logger.error(f"Error processing frame for {cam_id}: {e}")
             return False
     
+    def _overlay_pupil_detection(self, cam_id, img):
+        """Overlay pupil detection results on the image."""
+        try:
+            # Only apply to eye camera images
+            if not cam_id.startswith("eye"):
+                return
+            
+            # Get pupil positions
+            pupil_data = self.pupil_detector.get_pupil_positions()
+            
+            # Get the detection for this specific camera
+            detection = pupil_data.get(cam_id)
+            
+            if detection and "center" in detection and "radius" in detection:
+                center = detection["center"]
+                radius = detection["radius"]
+                confidence = detection.get("confidence", 0)
+                
+                # Draw pupil circle
+                cv2.circle(img, center, radius, (0, 255, 0), 2)
+                cv2.circle(img, center, 2, (0, 0, 255), -1)  # Center point
+                
+                # Add confidence text
+                conf_text = f"Conf: {confidence:.1f}%"
+                cv2.putText(img, conf_text, (10, img.shape[0] - 10), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                
+                # If this is eye0 or eye1, also update world display with gaze point
+                if self.current_frames["world"] is not None:
+                    # Simple placeholder for pupil position in world view
+                    # In a real implementation, this would use calibrated gaze mapping
+                    world_img = self.current_frames["world"]
+                    
+                    # Place a small dot in the world view at an approximate position
+                    # This is just a visual indicator and not a proper gaze estimate
+                    if cam_id == "eye0":
+                        # Approximate position for eye0 (left side of image)
+                        pos_x = world_img.shape[1] // 4
+                        pos_y = world_img.shape[0] // 2
+                        cv2.circle(world_img, (pos_x, pos_y), 5, (255, 0, 0), -1)
+                    elif cam_id == "eye1":
+                        # Approximate position for eye1 (right side of image)
+                        pos_x = world_img.shape[1] * 3 // 4
+                        pos_y = world_img.shape[0] // 2
+                        cv2.circle(world_img, (pos_x, pos_y), 5, (0, 0, 255), -1)
+                
+        except Exception as e:
+            logger.error(f"Error overlaying pupil detection: {e}")
+    
     def run(self):
         """Run the main display loop with optimized timing."""
         # Connect to service
@@ -253,6 +314,10 @@ class VideoDisplay:
             logger.error("Failed to create windows, cannot continue")
             self.disconnect()
             return
+        
+        # Start pupil detector if enabled
+        if self.show_pupils and self.pupil_detector:
+            self.pupil_detector.start(show_visualization=False)
         
         logger.info(f"Starting display loop with target {self.target_fps} FPS")
         self.running = True
@@ -295,6 +360,9 @@ class VideoDisplay:
                 if key == ord('q') or key == 27:  # 'q' or ESC
                     logger.info("Quit requested")
                     self.running = False
+                elif key == ord('p'):  # Toggle pupil detection
+                    self.show_pupils = not self.show_pupils
+                    logger.info(f"Pupil detection visualization {'enabled' if self.show_pupils else 'disabled'}")
                 
                 # Calculate how long to sleep to maintain target frame rate
                 current_time = time.monotonic()
@@ -328,6 +396,8 @@ class VideoDisplay:
         finally:
             # Clean up
             self.running = False
+            if self.pupil_detector:
+                self.pupil_detector.stop()
             self.disconnect()
             cv2.destroyAllWindows()
             logger.info("Display stopped")

@@ -24,18 +24,21 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Camera service host address")
     parser.add_argument("--port", type=int, default=5555, help="Camera service port")
     parser.add_argument("--fps", type=int, default=30, help="Target display frames per second")
+    parser.add_argument("--pupils", action="store_true", help="Show pupil detection overlay")
     args = parser.parse_args()
     
     # Print instructions
     print("Pupil Core Video Display")
     print("---------------------")
     print("Press 'q' or ESC to quit")
+    print("Press 'p' to toggle pupil detection overlay")
     
     # Create and run display
     display = VideoDisplay(
         server_host=args.host,
         server_port=args.port,
-        target_fps=args.fps
+        target_fps=args.fps,
+        show_pupils=args.pupils
     )
     
     # Run the display
