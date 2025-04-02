@@ -82,14 +82,20 @@ class CameraService:
         
         # Frame queue for each camera
         self.frame_queues = {
-            "world": Queue(maxsize=5),
-            "eye0": Queue(maxsize=5),
-            "eye1": Queue(maxsize=5)
+            "world": Queue(maxsize=10),
+            "eye0": Queue(maxsize=30),
+            "eye1": Queue(maxsize=30)
         }
         
         # Control variables
         self.running = False
         self.threads = []
+        
+        # Add locks for thread safety
+        self.recorder_lock = threading.Lock()
+        self.camera_lock = threading.Lock()
+        self.client_lock = threading.Lock()
+        self.stream_lock = threading.Lock()
     
     def init_cameras(self):
         """Initialize camera manager."""
@@ -195,7 +201,8 @@ class CameraService:
                 client_id = message.get("client_id", "unknown")
                 
                 # Add client to tracking
-                self.clients.add(client_id)
+                with self.client_lock:
+                    self.clients.add(client_id)
                 
                 # Process command
                 response = self.process_command(command, params, client_id)
@@ -247,7 +254,8 @@ class CameraService:
             
         elif command == "start_streaming":
             cam_id = params.get("camera_id", "world")
-            self.active_streams.add(cam_id)
+            with self.stream_lock:
+                self.active_streams.add(cam_id)
             return {
                 "status": "ok",
                 "message": f"Streaming started for {cam_id}"
@@ -255,8 +263,9 @@ class CameraService:
             
         elif command == "stop_streaming":
             cam_id = params.get("camera_id", "world")
-            if cam_id in self.active_streams:
-                self.active_streams.remove(cam_id)
+            with self.stream_lock:
+                if cam_id in self.active_streams:
+                    self.active_streams.remove(cam_id)
             return {
                 "status": "ok",
                 "message": f"Streaming stopped for {cam_id}"
@@ -269,8 +278,9 @@ class CameraService:
             return self.set_camera_property(cam_id, property_name, value)
             
         elif command == "disconnect":
-            if client_id in self.clients:
-                self.clients.remove(client_id)
+            with self.client_lock:
+                if client_id in self.clients:
+                    self.clients.remove(client_id)
             return {
                 "status": "ok",
                 "message": "Disconnected"
@@ -294,22 +304,31 @@ class CameraService:
         }
         
         # Add camera status
-        for cam_id, cam in self.cameras.items():
-            if cam:
-                status["cameras"][cam_id] = {
-                    "online": cam.online,
-                    "name": cam.name,
-                    "frame_size": cam.frame_size,
-                    "frame_rate": cam.frame_rate
-                }
+        with self.camera_lock:
+            for cam_id, cam in self.cameras.items():
+                if cam:
+                    status["cameras"][cam_id] = {
+                        "online": cam.online,
+                        "name": cam.name,
+                        "frame_size": cam.frame_size,
+                        "frame_rate": cam.frame_rate
+                    }
         
         # Add recording info if recording
         if self.is_recording and self.recorder:
-            status["recording_info"] = {
-                "path": self.recording_path,
-                "duration": self.recorder.recording_time,
-                "frame_stats": self.recorder.get_recording_stats()
-            }
+            try:
+                with self.recorder_lock:
+                    status["recording_info"] = {
+                        "path": self.recording_path,
+                        "duration": self.recorder.recording_time,
+                        "frame_stats": self.recorder.get_recording_stats()
+                    }
+            except Exception as e:
+                logger.error(f"Error getting recording info: {e}")
+                status["recording_info"] = {
+                    "path": self.recording_path,
+                    "error": str(e)
+                }
         
         return status
     
@@ -318,18 +337,23 @@ class CameraService:
         camera_info = {}
         
         # Add connected cameras
-        for cam_id, cam in self.cameras.items():
-            if cam:
-                camera_info[cam_id] = {
-                    "online": cam.online,
-                    "name": cam.name,
-                    "frame_size": cam.frame_size,
-                    "frame_rate": cam.frame_rate
-                }
-                
-                # Add camera controls if online
-                if cam.online:
-                    camera_info[cam_id]["controls"] = cam.get_all_controls()
+        with self.camera_lock:
+            for cam_id, cam in self.cameras.items():
+                if cam:
+                    camera_info[cam_id] = {
+                        "online": cam.online,
+                        "name": cam.name,
+                        "frame_size": cam.frame_size,
+                        "frame_rate": cam.frame_rate
+                    }
+                    
+                    # Add camera controls if online
+                    if cam.online:
+                        try:
+                            camera_info[cam_id]["controls"] = cam.get_all_controls()
+                        except Exception as e:
+                            logger.error(f"Error getting controls for {cam_id}: {e}")
+                            camera_info[cam_id]["controls"] = {}
         
         # Add available cameras
         try:
@@ -342,137 +366,150 @@ class CameraService:
     
     def start_recording(self, session_name=None):
         """Start recording from all cameras."""
-        if self.is_recording:
-            return {
-                "status": "error",
-                "message": "Recording already in progress"
-            }
-        
-        if not self.recorder:
-            return {
-                "status": "error",
-                "message": "Recorder not initialized"
-            }
-        
-        try:
-            # Start recording
-            self.recording_path = self.recorder.start(
-                world_cam=self.cameras.get("world_cam"),
-                eye0_cam=self.cameras.get("eye0_cam"),
-                eye1_cam=self.cameras.get("eye1_cam")
-            )
+        with self.recorder_lock:
+            if self.is_recording:
+                return {
+                    "status": "error",
+                    "message": "Recording already in progress"
+                }
             
-            self.is_recording = True
-            logger.info(f"Recording started: {self.recording_path}")
+            if not self.recorder:
+                return {
+                    "status": "error",
+                    "message": "Recorder not initialized"
+                }
             
-            return {
-                "status": "ok",
-                "message": "Recording started",
-                "path": self.recording_path
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to start recording: {e}")
-            return {
-                "status": "error",
-                "message": f"Failed to start recording: {e}"
-            }
+            try:
+                # Clear frame queues before starting a new recording
+                for queue in self.frame_queues.values():
+                    while not queue.empty():
+                        try:
+                            queue.get_nowait()
+                        except Empty:
+                            break
+                
+                # Start recording
+                self.recording_path = self.recorder.start(
+                    world_cam=self.cameras.get("world_cam"),
+                    eye0_cam=self.cameras.get("eye0_cam"),
+                    eye1_cam=self.cameras.get("eye1_cam")
+                )
+                
+                self.is_recording = True
+                logger.info(f"Recording started: {self.recording_path}")
+                
+                return {
+                    "status": "ok",
+                    "message": "Recording started",
+                    "path": self.recording_path
+                }
+                
+            except Exception as e:
+                logger.error(f"Failed to start recording: {e}")
+                return {
+                    "status": "error",
+                    "message": f"Failed to start recording: {e}"
+                }
     
     def stop_recording(self):
         """Stop recording."""
-        if not self.is_recording:
-            return {
-                "status": "error",
-                "message": "No recording in progress"
-            }
-        
-        try:
-            # Stop recording
-            path, stats = self.recorder.stop()
+        with self.recorder_lock:
+            if not self.is_recording:
+                return {
+                    "status": "error",
+                    "message": "No recording in progress"
+                }
             
-            self.is_recording = False
-            logger.info(f"Recording stopped: {path}")
-            
-            return {
-                "status": "ok",
-                "message": "Recording stopped",
-                "path": path,
-                "stats": stats
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to stop recording: {e}")
-            return {
-                "status": "error",
-                "message": f"Failed to stop recording: {e}"
-            }
+            try:
+                # Stop recording
+                path, stats = self.recorder.stop()
+                
+                self.is_recording = False
+                logger.info(f"Recording stopped: {path}")
+                
+                return {
+                    "status": "ok",
+                    "message": "Recording stopped",
+                    "path": path,
+                    "stats": stats
+                }
+                
+            except Exception as e:
+                logger.error(f"Failed to stop recording: {e}")
+                # Make sure to reset recording state even if there's an error
+                self.is_recording = False
+                return {
+                    "status": "error",
+                    "message": f"Failed to stop recording: {e}"
+                }
     
     def set_camera_property(self, cam_id, property_name, value):
         """Set a camera property."""
-        if cam_id not in self.cameras:
-            return {
-                "status": "error",
-                "message": f"Unknown camera: {cam_id}"
-            }
-        
-        cam = self.cameras.get(f"{cam_id}_cam")
-        if not cam or not cam.online:
-            return {
-                "status": "error",
-                "message": f"Camera {cam_id} is offline"
-            }
-        
-        try:
-            # Handle different properties
-            if property_name == "exposure_time":
-                cam.exposure_time = value
+        with self.camera_lock:
+            if cam_id not in self.cameras:
                 return {
-                    "status": "ok",
-                    "message": f"Set {cam_id} exposure time to {value}",
-                    "new_value": cam.exposure_time
+                    "status": "error",
+                    "message": f"Unknown camera: {cam_id}"
                 }
             
-            elif property_name == "gamma":
-                cam.gamma = value
+            cam = self.cameras.get(f"{cam_id}_cam")
+            if not cam or not cam.online:
                 return {
-                    "status": "ok",
-                    "message": f"Set {cam_id} gamma to {value}",
-                    "new_value": cam.gamma
+                    "status": "error",
+                    "message": f"Camera {cam_id} is offline"
                 }
             
-            elif property_name == "saturation":
-                cam.saturation = value
-                return {
-                    "status": "ok",
-                    "message": f"Set {cam_id} saturation to {value}",
-                    "new_value": cam.saturation
-                }
-            
-            elif property_name in cam.get_all_controls():
-                result = cam.set_control_value(property_name, value)
-                if result:
+            try:
+                # Handle different properties
+                if property_name == "exposure_time":
+                    cam.exposure_time = value
                     return {
                         "status": "ok",
-                        "message": f"Set {cam_id} {property_name} to {value}"
+                        "message": f"Set {cam_id} exposure time to {value}",
+                        "new_value": cam.exposure_time
                     }
+                
+                elif property_name == "gamma":
+                    cam.gamma = value
+                    return {
+                        "status": "ok",
+                        "message": f"Set {cam_id} gamma to {value}",
+                        "new_value": cam.gamma
+                    }
+                
+                elif property_name == "saturation":
+                    cam.saturation = value
+                    return {
+                        "status": "ok",
+                        "message": f"Set {cam_id} saturation to {value}",
+                        "new_value": cam.saturation
+                    }
+                
+                elif property_name in cam.get_all_controls():
+                    result = cam.set_control_value(property_name, value)
+                    if result:
+                        return {
+                            "status": "ok",
+                            "message": f"Set {cam_id} {property_name} to {value}"
+                        }
+                    else:
+                        return {
+                            "status": "error",
+                            "message": f"Failed to set {property_name}"
+                        }
+                
                 else:
                     return {
                         "status": "error",
-                        "message": f"Failed to set {property_name}"
+                        "message": f"Unknown property: {property_name}"
                     }
-            
-            else:
+                    
+            except Exception as e:
+                logger.error(f"Error setting camera property: {e}")
                 return {
                     "status": "error",
-                    "message": f"Unknown property: {property_name}"
+                    "message": f"Error: {e}"
                 }
-                
-        except Exception as e:
-            logger.error(f"Error setting camera property: {e}")
-            return {
-                "status": "error",
-                "message": f"Error: {e}"
-            }
     
     def capture_frames(self, cam_id):
         """Capture frames from a camera and add to queue."""
@@ -509,18 +546,27 @@ class CameraService:
                         pass
                 queue.put(frame)
                 
-                # If recording, update recorder
+                # If recording, update recorder with proper locking
                 if self.is_recording and self.recorder:
-                    if cam_id == "world":
-                        self.recorder.update(world_frame=frame)
-                    elif cam_id == "eye0":
-                        self.recorder.update(eye0_frame=frame)
-                    elif cam_id == "eye1":
-                        self.recorder.update(eye1_frame=frame)
+                    with self.recorder_lock:
+                        if not self.is_recording:
+                            # Double-check that recording is still active
+                            continue
+                            
+                        try:
+                            if cam_id == "world":
+                                self.recorder.update(world_frame=frame, eye0_frame=None, eye1_frame=None)
+                            elif cam_id == "eye0":
+                                self.recorder.update(world_frame=None, eye0_frame=frame, eye1_frame=None)
+                            elif cam_id == "eye1":
+                                self.recorder.update(world_frame=None, eye0_frame=None, eye1_frame=frame)
+                        except Exception as e:
+                            logger.error(f"Error updating recorder with {cam_id} frame: {e}")
                 
                 # If camera is being streamed, publish frame
-                if cam_id in self.active_streams:
-                    self.publish_frame(cam_id, frame)
+                with self.stream_lock:
+                    if cam_id in self.active_streams:
+                        self.publish_frame(cam_id, frame)
                 
                 # Small sleep to prevent busy waiting
                 time.sleep(0.001)
@@ -532,7 +578,7 @@ class CameraService:
     def publish_frame(self, cam_id, frame):
         """Publish a frame to clients."""
         try:
-            # Convert frame to PNG-encoded bytes
+            # Convert frame to JPEG-encoded bytes
             _, img_encoded = cv2.imencode(".jpg", frame.img, [cv2.IMWRITE_JPEG_QUALITY, 80])
             img_bytes = img_encoded.tobytes()
             
@@ -571,6 +617,36 @@ class CameraService:
             except Exception as e:
                 logger.error(f"Error publishing status: {e}")
                 time.sleep(1.0)
+
+    def cleanup(self):
+        """Clean up all resources."""
+        logger.info("Cleaning up resources...")
+        
+        # Stop recording if active
+        if self.is_recording:
+            try:
+                self.stop_recording()
+            except Exception as e:
+                logger.error(f"Error stopping recording during cleanup: {e}")
+        
+        # Clean up cameras
+        if self.cameras:
+            for cam in self.cameras.values():
+                try:
+                    if cam:
+                        cam.cleanup()
+                except Exception as e:
+                    logger.error(f"Error cleaning up camera: {e}")
+        
+        # Close ZeroMQ sockets
+        try:
+            self.command_socket.close()
+            self.pub_socket.close()
+            self.context.term()
+        except Exception as e:
+            logger.error(f"Error closing ZeroMQ sockets: {e}")
+        
+        logger.info("Cleanup completed")
 
 
 def main():

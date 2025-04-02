@@ -7,6 +7,7 @@ import os
 import time
 import logging
 import uuid
+import threading
 from pathlib import Path
 from fractions import Fraction
 import json
@@ -48,6 +49,7 @@ class VideoWriter:
         self.time_base = Fraction(1, 65535)  # High precision timebase
         self.configured = False
         self.closed = False
+        self.lock = threading.Lock()  # Add lock for thread safety
         
         # Extract file extension
         _, ext = os.path.splitext(output_file_path)
@@ -81,90 +83,92 @@ class VideoWriter:
         Args:
             frame: Frame to write
         """
-        if self.closed:
-            logger.warning("Cannot write to closed writer")
-            return False
-        
-        # Configure on first frame
-        if not self.configured:
-            self.stream.width = frame.width
-            self.stream.height = frame.height
-            self.configured = True
-            self._init_encoder(frame)
-            logger.info(f"Configured video stream: {frame.width}x{frame.height}")
-        
-        # Get frame timestamp and calculate pts
-        timestamp = frame.timestamp
-        
-        # ALWAYS write the first frame, otherwise do timestamp check
-        if self.timestamps and timestamp < self.start_time:
-            # Log and skip frames that arrive before recording start time
-            logger.debug(f"Skipping early frame: ts={timestamp}, start={self.start_time}")
-            return False
-        
-        # Check for monotonic timestamps
-        if self.timestamps and timestamp <= self.timestamps[-1]:
-            logger.warning(f"Non-monotonic timestamp: {self.timestamps[-1]} -> {timestamp}")
-            return False
-        
-        # Calculate presentation timestamp (PTS)
-        pts = int((timestamp - self.start_time) / self.time_base)
-        
-        # Ensure PTS is always increasing
-        pts = max(pts, self.last_pts + 1)
-        
-        # Encode and write frame
-        try:
-            packets = list(self._encode_frame(frame, pts))
-            if not packets:
-                logger.warning("Frame encoding produced no packets")
+        with self.lock:  # Thread safety
+            if self.closed:
+                logger.warning("Cannot write to closed writer")
                 return False
             
-            for packet in packets:
-                self.container.mux(packet)
+            # Configure on first frame
+            if not self.configured:
+                self.stream.width = frame.width
+                self.stream.height = frame.height
+                self.configured = True
+                self._init_encoder(frame)
+                logger.info(f"Configured video stream: {frame.width}x{frame.height}")
             
-            # Update state
-            self.last_pts = pts
-            self.timestamps.append(timestamp)
+            # Get frame timestamp and calculate pts
+            timestamp = frame.timestamp
             
-            # Log occasional success
-            if len(self.timestamps) in [1, 10, 50, 100]:
-                logger.info(f"Successfully wrote frame {len(self.timestamps)}")
+            # ALWAYS write the first frame, otherwise do timestamp check
+            if self.timestamps and timestamp < self.start_time:
+                # Log and skip frames that arrive before recording start time
+                logger.debug(f"Skipping early frame: ts={timestamp}, start={self.start_time}")
+                return False
             
-            return True
+            # Check for monotonic timestamps
+            if self.timestamps and timestamp <= self.timestamps[-1]:
+                logger.warning(f"Non-monotonic timestamp: {self.timestamps[-1]} -> {timestamp}")
+                return False
             
-        except Exception as e:
-            logger.error(f"Error writing frame: {e}")
-            return False
+            # Calculate presentation timestamp (PTS)
+            pts = int((timestamp - self.start_time) / self.time_base)
+            
+            # Ensure PTS is always increasing
+            pts = max(pts, self.last_pts + 1)
+            
+            # Encode and write frame
+            try:
+                packets = list(self._encode_frame(frame, pts))
+                if not packets:
+                    logger.warning("Frame encoding produced no packets")
+                    return False
+                
+                for packet in packets:
+                    self.container.mux(packet)
+                
+                # Update state
+                self.last_pts = pts
+                self.timestamps.append(timestamp)
+                
+                # Log occasional success
+                if len(self.timestamps) in [1, 10, 50, 100]:
+                    logger.info(f"Successfully wrote frame {len(self.timestamps)}")
+                
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error writing frame: {e}")
+                return False
     
     def close(self):
         """Close the writer and finalize the video file."""
-        if self.closed:
-            return
-        
-        try:
-            # Flush any remaining frames
-            if self.configured:
-                for packet in self.stream.encode(None):
-                    self.container.mux(packet)
+        with self.lock:  # Thread safety
+            if self.closed:
+                return
             
-            # Close container
-            self.container.close()
-            
-            # Rename from temp file to final file
-            if os.path.exists(self.temp_path):
-                os.rename(self.temp_path, self.output_file_path)
-                logger.info(f"Finalized video file: {self.output_file_path}")
+            try:
+                # Flush any remaining frames
+                if self.configured:
+                    for packet in self.stream.encode(None):
+                        self.container.mux(packet)
                 
-                # Save timestamps
-                self._save_timestamps()
-            else:
-                logger.warning(f"Temp file not found: {self.temp_path}")
+                # Close container
+                self.container.close()
                 
-        except Exception as e:
-            logger.error(f"Error closing video writer: {e}")
-        finally:
-            self.closed = True
+                # Rename from temp file to final file
+                if os.path.exists(self.temp_path):
+                    os.rename(self.temp_path, self.output_file_path)
+                    logger.info(f"Finalized video file: {self.output_file_path}")
+                    
+                    # Save timestamps
+                    self._save_timestamps()
+                else:
+                    logger.warning(f"Temp file not found: {self.temp_path}")
+                    
+            except Exception as e:
+                logger.error(f"Error closing video writer: {e}")
+            finally:
+                self.closed = True
     
     def _save_timestamps(self):
         """Save timestamps to a numpy file."""
@@ -295,6 +299,7 @@ class H264Writer:
         self.configured = False
         self.closed = False
         self.timestamps = []
+        self.lock = threading.Lock()  # Add lock for thread safety
         
         # Create output directory if needed
         os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
@@ -328,50 +333,52 @@ class H264Writer:
         Args:
             frame: Frame with h264_buffer to write
         """
-        if self.closed:
-            logger.warning("Cannot write to closed writer")
-            return False
-        
-        # Check for H264 buffer
-        if not hasattr(frame, 'h264_buffer') or frame.h264_buffer is None:
-            logger.warning("Frame has no H264 buffer")
-            return False
-        
-        # Store timestamp
-        self.timestamps.append(frame.timestamp)
-        
-        # Create packet from H264 buffer
-        try:
-            packet = Packet(frame.h264_buffer)
-            packet.stream = self.stream
-            self.container.mux(packet)
-            return True
-        except Exception as e:
-            logger.error(f"Error writing H264 frame: {e}")
-            return False
+        with self.lock:  # Thread safety
+            if self.closed:
+                logger.warning("Cannot write to closed writer")
+                return False
+            
+            # Check for H264 buffer
+            if not hasattr(frame, 'h264_buffer') or frame.h264_buffer is None:
+                logger.warning("Frame has no H264 buffer")
+                return False
+            
+            # Store timestamp
+            self.timestamps.append(frame.timestamp)
+            
+            # Create packet from H264 buffer
+            try:
+                packet = Packet(frame.h264_buffer)
+                packet.stream = self.stream
+                self.container.mux(packet)
+                return True
+            except Exception as e:
+                logger.error(f"Error writing H264 frame: {e}")
+                return False
     
     def close(self):
         """Close the writer and finalize the video file."""
-        if self.closed:
-            return
-        
-        try:
-            # Close container
-            self.container.close()
+        with self.lock:  # Thread safety
+            if self.closed:
+                return
             
-            # Rename from temp file to final file
-            if os.path.exists(self.temp_path):
-                os.rename(self.temp_path, self.output_file_path)
-                logger.info(f"Finalized H264 video file: {self.output_file_path}")
+            try:
+                # Close container
+                self.container.close()
                 
-                # Save timestamps
-                self._save_timestamps()
-            else:
-                logger.warning(f"Temp file not found: {self.temp_path}")
-        except Exception as e:
-            logger.error(f"Error closing H264 writer: {e}")
-        finally:
-            self.closed = True
+                # Rename from temp file to final file
+                if os.path.exists(self.temp_path):
+                    os.rename(self.temp_path, self.output_file_path)
+                    logger.info(f"Finalized H264 video file: {self.output_file_path}")
+                    
+                    # Save timestamps
+                    self._save_timestamps()
+                else:
+                    logger.warning(f"Temp file not found: {self.temp_path}")
+            except Exception as e:
+                logger.error(f"Error closing H264 writer: {e}")
+            finally:
+                self.closed = True
     
     def _save_timestamps(self):
         """Save timestamps to a numpy file."""
@@ -424,6 +431,9 @@ class Recorder:
         # Track frames for each camera separately
         self.frame_counts = {"world": 0, "eye0": 0, "eye1": 0}
         self.start_time = None
+        
+        # Add a lock for thread safety
+        self.lock = threading.Lock()
     
     def start(self, world_cam=None, eye0_cam=None, eye1_cam=None):
         """
@@ -437,80 +447,90 @@ class Recorder:
         Returns:
             Path to the recording directory
         """
-        if self.running:
-            logger.warning("Recording already running")
-            return self.current_rec_path
-        
-        # Get synchronized start time - use time.monotonic() if uvc not available
-        try:
-            import uvc
-            self.start_time = uvc.get_time_monotonic()
-        except ImportError:
-            self.start_time = time.monotonic()
+        with self.lock:  # Thread safety
+            if self.running:
+                logger.warning("Recording already running")
+                return self.current_rec_path
             
-        logger.info(f"Recording start time: {self.start_time}")
-        
-        # Create session directory
-        session_dir = os.path.join(self.rec_dir, self.session_name)
-        os.makedirs(session_dir, exist_ok=True)
-        
-        # Create new numbered recording directory
-        counter = 0
-        while True:
-            rec_path = os.path.join(session_dir, f"{counter:03d}")
-            if not os.path.exists(rec_path):
-                os.makedirs(rec_path)
-                break
-            counter += 1
-        
-        self.current_rec_path = rec_path
-        logger.info(f"Created recording directory: {rec_path}")
-        
-        # Create metadata
-        self._save_recording_info()
-        
-        # Initialize video writers
-        if world_cam and world_cam.online:
-            self._init_world_writer(world_cam)
-        
-        if eye0_cam and eye0_cam.online:
-            self._init_eye_writer(eye0_cam, "eye0")
-        
-        if eye1_cam and eye1_cam.online:
-            self._init_eye_writer(eye1_cam, "eye1")
-        
-        self.running = True
-        self.frame_count = 0
-        # Reset frame counters
-        self.frame_counts = {"world": 0, "eye0": 0, "eye1": 0}
-        return self.current_rec_path
+            # Get synchronized start time - use time.monotonic() if uvc not available
+            try:
+                import uvc
+                self.start_time = uvc.get_time_monotonic()
+            except ImportError:
+                self.start_time = time.monotonic()
+                
+            logger.info(f"Recording start time: {self.start_time}")
+            
+            # Create session directory
+            session_dir = os.path.join(self.rec_dir, self.session_name)
+            os.makedirs(session_dir, exist_ok=True)
+            
+            # Create new numbered recording directory
+            counter = 0
+            while True:
+                rec_path = os.path.join(session_dir, f"{counter:03d}")
+                if not os.path.exists(rec_path):
+                    os.makedirs(rec_path)
+                    break
+                counter += 1
+            
+            self.current_rec_path = rec_path
+            logger.info(f"Created recording directory: {rec_path}")
+            
+            # Create metadata
+            self._save_recording_info()
+            
+            # Initialize video writers
+            try:
+                if world_cam and world_cam.online:
+                    self._init_world_writer(world_cam)
+                
+                if eye0_cam and eye0_cam.online:
+                    self._init_eye_writer(eye0_cam, "eye0")
+                
+                if eye1_cam and eye1_cam.online:
+                    self._init_eye_writer(eye1_cam, "eye1")
+                
+                self.running = True
+                self.frame_count = 0
+                # Reset frame counters
+                self.frame_counts = {"world": 0, "eye0": 0, "eye1": 0}
+                
+            except Exception as e:
+                logger.error(f"Error initializing writers: {e}")
+                # Clean up on error
+                self._cleanup_writers()
+                raise
+                
+            return self.current_rec_path
     
     def update(self, world_frame=None, eye0_frame=None, eye1_frame=None):
         """
-        Update recording with new frames.
+        Update recording with new frames with thread safety.
         
         Args:
             world_frame: New world camera frame
             eye0_frame: New eye0 camera frame
             eye1_frame: New eye1 camera frame
         """
-        if not self.running:
-            return
-        
-        # Write world frame
-        if world_frame and self.world_writer:
-            if self.world_writer.write_frame(world_frame):
-                self.frame_count += 1  # Keep for backward compatibility
-                self.frame_counts["world"] += 1
-        
-        # Write eye frames
-        if eye0_frame and "eye0" in self.eye_writers:
-            if self.eye_writers["eye0"].write_frame(eye0_frame):
-                self.frame_counts["eye0"] += 1
-        
-        if eye1_frame and "eye1" in self.eye_writers:
-            if self.eye_writers["eye1"].write_frame(eye1_frame):
-                self.frame_counts["eye1"] += 1
+        with self.lock:  # Thread safety
+            if not self.running:
+                return
+            
+            # Write world frame
+            if world_frame and self.world_writer:
+                if self.world_writer.write_frame(world_frame):
+                    self.frame_count += 1  # Keep for backward compatibility
+                    self.frame_counts["world"] += 1
+            
+            # Write eye frames
+            if eye0_frame and "eye0" in self.eye_writers:
+                if self.eye_writers["eye0"].write_frame(eye0_frame):
+                    self.frame_counts["eye0"] += 1
+            
+            if eye1_frame and "eye1" in self.eye_writers:
+                if self.eye_writers["eye1"].write_frame(eye1_frame):
+                    self.frame_counts["eye1"] += 1
     
     def stop(self):
         """
@@ -519,43 +539,70 @@ class Recorder:
         Returns:
             Tuple of (recording path, statistics)
         """
-        if not self.running:
-            return
-        
-        # Calculate recording duration
+        with self.lock:  # Thread safety
+            if not self.running:
+                # Return empty stats if not running
+                return self.current_rec_path, {
+                    "world": {"frames": 0, "fps": 0},
+                    "eye0": {"frames": 0, "fps": 0},
+                    "eye1": {"frames": 0, "fps": 0}
+                }
+            
+            # Calculate recording duration
+            try:
+                import uvc
+                duration = uvc.get_time_monotonic() - self.start_time
+            except ImportError:
+                duration = time.monotonic() - self.start_time
+            
+            # Calculate statistics
+            stats = {}
+            for camera_id in ["world", "eye0", "eye1"]:
+                frames = self.frame_counts[camera_id]
+                fps = frames / duration if duration > 0 else 0
+                stats[camera_id] = {"frames": frames, "fps": fps}
+            
+            # Close all writers
+            self._cleanup_writers()
+            
+            # Update metadata with duration and stats
+            self._update_recording_info(duration, stats)
+            
+            # Set state to not running before returning
+            self.running = False
+            logger.info(f"Recording stopped. Duration: {duration:.2f}s, Total frames: {self.frame_count}")
+            
+            # Store path before possibly changing in a new recording
+            current_path = self.current_rec_path
+            
+            return current_path, stats
+    
+    def _cleanup_writers(self):
+        """Clean up all writers properly with error handling."""
         try:
-            import uvc
-            duration = uvc.get_time_monotonic() - self.start_time
-        except ImportError:
-            duration = time.monotonic() - self.start_time
-        
-        # Calculate statistics
-        stats = {}
-        for camera_id in ["world", "eye0", "eye1"]:
-            frames = self.frame_counts[camera_id]
-            fps = frames / duration if duration > 0 else 0
-            stats[camera_id] = {"frames": frames, "fps": fps}
-        
-        # Close all writers
-        if self.world_writer:
-            self.world_writer.close()
+            if self.world_writer:
+                self.world_writer.close()
+                self.world_writer = None
+        except Exception as e:
+            logger.error(f"Error closing world writer: {e}")
             self.world_writer = None
         
-        for writer in self.eye_writers.values():
-            writer.close()
-        self.eye_writers = {}
-        
-        # Update metadata with duration and stats
-        self._update_recording_info(duration, stats)
-        
-        self.running = False
-        logger.info(f"Recording stopped. Duration: {duration:.2f}s, Total frames: {self.frame_count}")
-        
-        return self.current_rec_path, stats
+        for eye_id, writer in list(self.eye_writers.items()):
+            try:
+                writer.close()
+            except Exception as e:
+                logger.error(f"Error closing {eye_id} writer: {e}")
+            finally:
+                self.eye_writers.pop(eye_id, None)
     
     def _init_world_writer(self, camera):
         """Initialize world camera writer."""
         path = os.path.join(self.current_rec_path, "world.mp4")
+        
+        # Safely check if camera has a recent frame
+        if not hasattr(camera, '_recent_frame') or camera._recent_frame is None:
+            logger.warning("World camera has no recent frame, cannot initialize writer")
+            return
         
         # Check for H264 buffer first
         if hasattr(camera._recent_frame, "h264_buffer"):
@@ -572,6 +619,11 @@ class Recorder:
     def _init_eye_writer(self, camera, eye_id):
         """Initialize eye camera writer."""
         path = os.path.join(self.current_rec_path, f"{eye_id}.mp4")
+        
+        # Safely check if camera has a recent frame
+        if not hasattr(camera, '_recent_frame') or camera._recent_frame is None:
+            logger.warning(f"{eye_id} camera has no recent frame, cannot initialize writer")
+            return
         
         # Check for H264 buffer first
         if hasattr(camera._recent_frame, "h264_buffer"):
@@ -609,6 +661,10 @@ class Recorder:
         try:
             info_path = os.path.join(self.current_rec_path, "info.json")
             
+            if not os.path.exists(info_path):
+                logger.warning(f"Recording info file not found: {info_path}")
+                return
+                
             with open(info_path, "r") as f:
                 info = json.load(f)
             
@@ -640,16 +696,17 @@ class Recorder:
             return time.monotonic() - self.start_time
     
     def get_recording_stats(self):
-        """Get current recording statistics."""
-        stats = {}
-        duration = self.recording_time
-        
-        for camera_id in ["world", "eye0", "eye1"]:
-            frames = self.frame_counts[camera_id]
-            fps = frames / duration if duration > 0 else 0
-            stats[camera_id] = {"frames": frames, "fps": fps}
-        
-        return stats
+        """Get current recording statistics with thread safety."""
+        with self.lock:
+            stats = {}
+            duration = self.recording_time
+            
+            for camera_id in ["world", "eye0", "eye1"]:
+                frames = self.frame_counts[camera_id]
+                fps = frames / duration if duration > 0 else 0
+                stats[camera_id] = {"frames": frames, "fps": fps}
+            
+            return stats
 
 
 ###############################################################################
@@ -722,18 +779,24 @@ def record_from_cameras(cameras, duration=5, output_dir=None, session_name=None)
     
     except KeyboardInterrupt:
         logger.info("Recording interrupted by user")
+    except Exception as e:
+        logger.error(f"Error during recording: {e}")
     
     # Stop recording and get stats
-    rec_path, stats = recorder.stop()
-    
-    # Display recording statistics
-    print("\nRecording statistics:")
-    for camera_id, data in stats.items():
-        if data["frames"] > 0:
-            print(f"  {camera_id.capitalize()}: {data['frames']} frames, {data['fps']:.2f} fps")
-    
-    print(f"\nRecording saved to: {rec_path}")
-    return rec_path
+    try:
+        rec_path, stats = recorder.stop()
+        
+        # Display recording statistics
+        print("\nRecording statistics:")
+        for camera_id, data in stats.items():
+            if data["frames"] > 0:
+                print(f"  {camera_id.capitalize()}: {data['frames']} frames, {data['fps']:.2f} fps")
+        
+        print(f"\nRecording saved to: {rec_path}")
+        return rec_path
+    except Exception as e:
+        logger.error(f"Error stopping recording: {e}")
+        return None
 
 
 # Simple usage example
