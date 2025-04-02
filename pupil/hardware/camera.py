@@ -1,7 +1,7 @@
 """
-Camera Manager
--------------
-Handles camera discovery, initialization, and frame capture for Pupil Core cameras.
+Base Camera
+----------
+Defines the base camera interfaces and UVC implementation for Pupil Core cameras.
 """
 import os
 import time
@@ -9,8 +9,8 @@ import logging
 import platform
 import re
 from fractions import Fraction
-import multiprocessing as mp
 import threading
+from abc import ABC, abstractmethod
 
 import numpy as np
 import uvc
@@ -28,15 +28,68 @@ class CameraMissingError(Exception):
     """Raised when a camera cannot be found."""
     pass
 
-class UVCSource:
+
+class BaseCamera(ABC):
     """
-    Camera source implementation using the UVC driver.
+    Abstract base class for camera implementations.
+    Defines the interface that all camera types must implement.
+    """
+    
+    @abstractmethod
+    def get_frame(self):
+        """Get the latest frame from the camera."""
+        pass
+    
+    @abstractmethod
+    def cleanup(self):
+        """Clean up resources."""
+        pass
+    
+    @property
+    @abstractmethod
+    def name(self):
+        """Get camera name."""
+        pass
+    
+    @property
+    @abstractmethod
+    def frame_size(self):
+        """Get current frame size."""
+        pass
+    
+    @property
+    @abstractmethod
+    def frame_rate(self):
+        """Get current frame rate."""
+        pass
+    
+    @property
+    @abstractmethod
+    def online(self):
+        """Check if camera is online."""
+        pass
+    
+    @property
+    @abstractmethod
+    def controls(self):
+        """Get all camera controls."""
+        pass
+    
+    @abstractmethod
+    def set_control_value(self, control_name, value):
+        """Set a camera control value."""
+        pass
+
+
+class UVCCamera(BaseCamera):
+    """
+    Camera implementation using the UVC driver.
     Manages camera connection, frame capture, and camera controls.
     """
     
     def __init__(self, name=None, uid=None, frame_size=(1280, 720), frame_rate=30, exposure_mode="auto"):
         """
-        Initialize a UVC camera source.
+        Initialize a UVC camera.
         
         Args:
             name: Camera name or pattern to match
@@ -439,7 +492,8 @@ class UVCSource:
         """Check if camera supports JPEG compression."""
         return self.uvc_capture is not None
     
-    def get_all_controls(self):
+    @property
+    def controls(self):
         """Get all camera controls as a dictionary."""
         controls = {}
         if self.uvc_capture:
@@ -482,104 +536,6 @@ class UVCSource:
         self.cleanup()
 
 
-def list_available_cameras():
-    """
-    List all available UVC cameras.
-    
-    Returns:
-        List of dicts with camera info
-    """
-    devices = uvc.Device_List()
-    return [
-        {
-            "id": i,
-            "name": d["name"],
-            "uid": d["uid"]
-        }
-        for i, d in enumerate(devices)
-    ]
-
-
-def find_camera_by_name(name_pattern):
-    """
-    Find a camera by name pattern.
-    
-    Args:
-        name_pattern: String pattern to match in camera name
-        
-    Returns:
-        Camera info dict or None if not found
-    """
-    devices = uvc.Device_List()
-    for device in devices:
-        if name_pattern in device['name']:
-            return device
-    return None
-
-
-def find_camera_by_uid(uid):
-    """
-    Find a camera by UID.
-    
-    Args:
-        uid: Camera UID to find
-        
-    Returns:
-        Camera info dict or None if not found
-    """
-    devices = uvc.Device_List()
-    for device in devices:
-        if device['uid'] == uid:
-            return device
-    return None
-
-
-def create_camera_manager(world_name="ID2", eye0_name="ID0", eye1_name="ID1", 
-                         world_exposure_mode="auto",  # Separate exposure mode for world camera
-                         eye_exposure_mode="manual",  # Separate exposure mode for eye cameras
-                         world_size=(1280, 720), world_fps=30, 
-                         eye_size=(192, 192), eye_fps=120):
-    """
-    Create a complete camera manager with world and eye cameras.
-    
-    Args:
-        world_name: Name pattern for world camera
-        eye0_name: Name pattern for eye0 camera
-        eye1_name: Name pattern for eye1 camera
-        world_exposure_mode: "auto" or "manual" exposure control for world camera
-        eye_exposure_mode: "auto" or "manual" exposure control for eye cameras
-        world_size: Frame size for world camera
-        world_fps: Frame rate for world camera
-        eye_size: Frame size for eye cameras
-        eye_fps: Frame rate for eye cameras
-        
-    Returns:
-        Dict with cameras
-    """
-    # Initialize cameras with different exposure modes
-    world_cam = UVCSource(name=world_name, frame_size=world_size, frame_rate=world_fps, 
-                          exposure_mode=world_exposure_mode)
-    
-    eye0_cam = UVCSource(name=eye0_name, frame_size=eye_size, frame_rate=eye_fps, 
-                         exposure_mode=eye_exposure_mode)
-    
-    eye1_cam = UVCSource(name=eye1_name, frame_size=eye_size, frame_rate=eye_fps, 
-                         exposure_mode=eye_exposure_mode)
-    
-    # Collect a few frames to stabilize cameras
-    for _ in range(10):
-        world_cam.get_frame()
-        eye0_cam.get_frame()
-        eye1_cam.get_frame()
-        time.sleep(0.01)
-    
-    return {
-        "world_cam": world_cam,
-        "eye0_cam": eye0_cam,
-        "eye1_cam": eye1_cam
-    }
-
-
 class CameraCapture:
     """
     High-level camera capture class with threading support.
@@ -591,7 +547,7 @@ class CameraCapture:
         Initialize camera capture.
         
         Args:
-            camera: UVCSource instance
+            camera: BaseCamera instance
         """
         self.camera = camera
         self.running = False
@@ -661,35 +617,3 @@ class CameraCapture:
             
             # Small sleep to prevent busy waiting
             time.sleep(0.001)
-
-
-# Simple usage example
-if __name__ == "__main__":
-    # List all cameras
-    print("Available cameras:")
-    for cam in list_available_cameras():
-        print(f"  {cam['id']}: {cam['name']} (UID: {cam['uid']})")
-    
-    # Create a camera manager
-    print("\nInitializing cameras...")
-    manager = create_camera_manager()
-    
-    # Show camera info
-    for name, cam in manager.items():
-        if cam.online:
-            print(f"{name}: {cam.name} at {cam.frame_size}@{cam.frame_rate}fps")
-    
-    # # Capture a few frames from the world camera
-    # if manager["world_cam"].online:
-    #     print("\nCapturing 10 frames from world camera...")
-    #     for i in range(10):
-    #         frame = manager["world_cam"].get_frame()
-    #         if frame:
-    #             print(f"Frame {i+1}: {frame.width}x{frame.height} at time {frame.timestamp:.3f}")
-    #         time.sleep(0.1)
-    
-    # Clean up
-    for cam in manager.values():
-        cam.cleanup()
-    
-    print("Done.")

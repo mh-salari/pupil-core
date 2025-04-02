@@ -1,14 +1,11 @@
 """
-Multi-Camera Video Display
-------------------------
-Simplified client that connects to the camera service and displays camera feeds:
-world, eye0, and eye1 simultaneously. Display only, no control functionality.
-Optimized for smooth display performance at ~30 FPS.
+Video Display
+-----------
+Client to display video streams from camera service.
 """
 import time
 import json
 import logging
-import argparse
 import uuid
 import sys
 
@@ -16,32 +13,28 @@ import zmq
 import cv2
 import numpy as np
 
+from ..service.message_types import MessageType
+from ..utils.timestamp import format_time
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("SimpleCameraDisplay")
+logger = logging.getLogger(__name__)
 
-class MessageType:
-    """Message types for ZeroMQ communication."""
-    COMMAND = 0
-    FRAME_REQUEST = 1
-    FRAME_RESPONSE = 2
-    STATUS_UPDATE = 3
-    ERROR = 4
 
-class SimpleCameraDisplay:
+class VideoDisplay:
     """
     Video display for multiple cameras.
     Displays world, eye0, and eye1 cameras simultaneously.
     Display only, with no recording or control functionality.
-    Optimized for smooth display performance at ~30 FPS.
+    Optimized for smooth display performance.
     """
     
     def __init__(self, server_host="127.0.0.1", server_port=5555, target_fps=30):
         """
-        Initialize the simple camera display.
+        Initialize the video display.
         
         Args:
             server_host: Camera service host address
@@ -50,7 +43,7 @@ class SimpleCameraDisplay:
         """
         self.server_host = server_host
         self.server_port = server_port
-        self.client_id = f"simple_display_{uuid.uuid4().hex[:8]}"
+        self.client_id = f"video_display_{uuid.uuid4().hex[:8]}"
         self.target_fps = target_fps
         self.target_frame_time = 1.0 / target_fps
         
@@ -225,8 +218,7 @@ class SimpleCameraDisplay:
             
             # Add timestamp text to image
             timestamp = metadata.get("timestamp")
-            time_str = time.strftime("%H:%M:%S", time.localtime(timestamp))
-            time_str += f".{int((timestamp % 1) * 1000):03d}"
+            time_str = format_time(timestamp)
             cv2.putText(img, time_str, (10, 20), 
                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
@@ -339,30 +331,3 @@ class SimpleCameraDisplay:
             self.disconnect()
             cv2.destroyAllWindows()
             logger.info("Display stopped")
-
-def main():
-    """Main entry point."""
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Simple Camera Display Client")
-    parser.add_argument("--host", default="127.0.0.1", help="Camera service host address")
-    parser.add_argument("--port", type=int, default=5555, help="Camera service port")
-    parser.add_argument("--fps", type=int, default=30, help="Target display frames per second")
-    args = parser.parse_args()
-    
-    # Print instructions
-    print("Simple Camera Display")
-    print("--------------------")
-    print("Press 'q' or ESC to quit")
-    
-    # Create and run display
-    display = SimpleCameraDisplay(
-        server_host=args.host,
-        server_port=args.port,
-        target_fps=args.fps
-    )
-    
-    # Run the display
-    display.run()
-
-if __name__ == "__main__":
-    main()

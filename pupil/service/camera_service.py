@@ -1,46 +1,36 @@
 """
 Camera Service
--------------
-Backbone service that manages cameras and recording, providing access via ZeroMQ.
+------------
+ZeroMQ-based service for remote camera access and recording control.
 """
 import os
 import time
 import json
 import logging
 import threading
-import argparse
-import signal
-import sys
 from queue import Queue, Empty
 from typing import Dict, List, Any, Optional, Tuple
 
 import zmq
 import numpy as np
-
 import cv2
 
-# Import local modules
-from camera_manager import UVCSource, create_camera_manager, list_available_cameras
-from video_recorder import Recorder
+# Import from our package
+from ..hardware.camera_discovery import CameraManager, list_available_cameras
+from ..io.recorder import Recorder
+from .message_types import MessageType
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("CameraService")
+logger = logging.getLogger(__name__)
 
-class MessageType:
-    """Message types for ZeroMQ communication."""
-    COMMAND = 0
-    FRAME_REQUEST = 1
-    FRAME_RESPONSE = 2
-    STATUS_UPDATE = 3
-    ERROR = 4
 
 class CameraService:
     """
-    Backbone service that manages cameras and provides access via ZeroMQ.
+    ZeroMQ-based service that manages cameras and provides remote access.
     Acts as a server for client applications to connect to.
     """
     
@@ -67,8 +57,8 @@ class CameraService:
         self.pub_socket = self.context.socket(zmq.PUB)  # Publisher for frames/status
         self.pub_socket.bind(f"tcp://{host}:{port+1}")
         
-        # Initialize cameras and recorder
-        self.cameras = None
+        # Initialize camera manager and recorder
+        self.camera_manager = None
         self.recorder = None
         self.init_cameras()
         self.init_recorder()
@@ -101,7 +91,8 @@ class CameraService:
         """Initialize camera manager."""
         try:
             logger.info("Initializing cameras...")
-            self.cameras = create_camera_manager()
+            self.camera_manager = CameraManager()
+            self.cameras = self.camera_manager.get_all_cameras()
             
             # Log camera status
             for name, cam in self.cameras.items():
@@ -170,9 +161,8 @@ class CameraService:
             thread.join(timeout=2.0)
         
         # Clean up cameras
-        if self.cameras:
-            for cam in self.cameras.values():
-                cam.cleanup()
+        if self.camera_manager:
+            self.camera_manager.cleanup()
         
         # Close ZeroMQ sockets
         self.command_socket.close()
@@ -350,7 +340,7 @@ class CameraService:
                     # Add camera controls if online
                     if cam.online:
                         try:
-                            camera_info[cam_id]["controls"] = cam.get_all_controls()
+                            camera_info[cam_id]["controls"] = cam.controls
                         except Exception as e:
                             logger.error(f"Error getting controls for {cam_id}: {e}")
                             camera_info[cam_id]["controls"] = {}
@@ -485,7 +475,7 @@ class CameraService:
                         "new_value": cam.saturation
                     }
                 
-                elif property_name in cam.get_all_controls():
+                elif property_name in cam.controls:
                     result = cam.set_control_value(property_name, value)
                     if result:
                         return {
@@ -617,7 +607,7 @@ class CameraService:
             except Exception as e:
                 logger.error(f"Error publishing status: {e}")
                 time.sleep(1.0)
-
+    
     def cleanup(self):
         """Clean up all resources."""
         logger.info("Cleaning up resources...")
@@ -630,13 +620,11 @@ class CameraService:
                 logger.error(f"Error stopping recording during cleanup: {e}")
         
         # Clean up cameras
-        if self.cameras:
-            for cam in self.cameras.values():
-                try:
-                    if cam:
-                        cam.cleanup()
-                except Exception as e:
-                    logger.error(f"Error cleaning up camera: {e}")
+        if self.camera_manager:
+            try:
+                self.camera_manager.cleanup()
+            except Exception as e:
+                logger.error(f"Error cleaning up cameras: {e}")
         
         # Close ZeroMQ sockets
         try:
@@ -647,46 +635,3 @@ class CameraService:
             logger.error(f"Error closing ZeroMQ sockets: {e}")
         
         logger.info("Cleanup completed")
-
-
-def main():
-    """Main entry point."""
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Camera Service")
-    parser.add_argument("--host", default="127.0.0.1", help="Host address to bind to")
-    parser.add_argument("--port", type=int, default=5555, help="Port to bind to")
-    parser.add_argument("--recording-dir", help="Directory to store recordings")
-    args = parser.parse_args()
-    
-    # Create and start service
-    service = CameraService(
-        host=args.host,
-        port=args.port,
-        recording_dir=args.recording_dir
-    )
-    
-    # Setup signal handlers for graceful shutdown
-    def signal_handler(sig, frame):
-        logger.info("Shutdown signal received")
-        service.stop()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Start service
-    try:
-        service.start()
-        
-        # Keep main thread alive
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        service.stop()
-    except Exception as e:
-        logger.error(f"Error in main loop: {e}")
-        service.stop()
-
-
-if __name__ == "__main__":
-    main()

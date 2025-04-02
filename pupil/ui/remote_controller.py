@@ -1,35 +1,29 @@
 """
-Remote Recording Controller
---------------------------
-Terminal-based client application that connects to the camera service
-and provides commands to control recording and query status.
+Remote Controller
+---------------
+Terminal-based client for controlling the camera service remotely.
 """
 import os
 import time
 import json
 import logging
 import threading
-import argparse
 import uuid
 import sys
 from queue import Queue, Empty
 
 import zmq
 
+from ..service.message_types import MessageType
+from ..utils.timestamp import format_duration
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("RemoteController")
+logger = logging.getLogger(__name__)
 
-class MessageType:
-    """Message types for ZeroMQ communication."""
-    COMMAND = 0
-    FRAME_REQUEST = 1
-    FRAME_RESPONSE = 2
-    STATUS_UPDATE = 3
-    ERROR = 4
 
 class RemoteController:
     """
@@ -186,12 +180,32 @@ class RemoteController:
                 if not self.sub_socket.poll(1000):
                     continue
                 
-                # Receive message
-                message = self.sub_socket.recv_json()
-                
-                # Check for status update
-                if message.get("type") == MessageType.STATUS_UPDATE:
-                    self.update_status(message)
+                # Receive message - handling both single and multipart messages
+                try:
+                    # Try to receive a multipart message
+                    message = self.sub_socket.recv_multipart(zmq.NOBLOCK)
+                    
+                    # If it's a multipart message, it may be frame data
+                    # We're only interested in the first part which is JSON metadata
+                    if message and len(message) > 0:
+                        # Parse the first part as JSON, ignore other parts (binary data)
+                        metadata = json.loads(message[0])
+                        
+                        # Check for status update
+                        if metadata.get("type") == MessageType.STATUS_UPDATE:
+                            self.update_status(metadata)
+                            
+                except zmq.Again:
+                    # If no multipart message, try simple JSON message
+                    try:
+                        message = self.sub_socket.recv_json()
+                        
+                        # Check for status update
+                        if message.get("type") == MessageType.STATUS_UPDATE:
+                            self.update_status(message)
+                    except zmq.Again:
+                        # No messages available
+                        continue
                 
             except zmq.ZMQError as e:
                 logger.error(f"ZMQ error receiving status: {e}")
@@ -235,7 +249,7 @@ class RemoteController:
         
         # Recording status
         if self.is_recording:
-            duration_str = self.format_duration(self.recording_duration)
+            duration_str = format_duration(self.recording_duration)
             print(f"Recording: ACTIVE ({duration_str})")
             print(f"Recording path: {self.recording_path}")
         else:
@@ -423,12 +437,6 @@ class RemoteController:
         else:
             print(f"Error: {response.get('message', 'Failed to stop recording')}")
     
-    def format_duration(self, seconds):
-        """Format duration as MM:SS.ms."""
-        minutes = int(seconds // 60)
-        seconds = seconds % 60
-        return f"{minutes:02d}:{seconds:05.2f}"
-    
     def process_commands(self):
         """Process commands from the user."""
         self.display_help()
@@ -503,32 +511,3 @@ class RemoteController:
             except Exception as e:
                 logger.error(f"Error processing command: {e}")
                 print(f"Error: {e}")
-    
-
-def main():
-    """Main entry point."""
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Remote Recording Controller")
-    parser.add_argument("--host", default="127.0.0.1", help="Camera service host address")
-    parser.add_argument("--port", type=int, default=5555, help="Camera service port")
-    args = parser.parse_args()
-    
-    # Create and start controller
-    controller = RemoteController(
-        server_host=args.host,
-        server_port=args.port
-    )
-    
-    try:
-        # Start controller
-        controller.start()
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-    except Exception as e:
-        logger.error(f"Error: {e}")
-    finally:
-        controller.stop()
-
-
-if __name__ == "__main__":
-    main()
