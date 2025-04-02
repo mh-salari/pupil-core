@@ -1,10 +1,10 @@
 """
 Multi-Camera Video Display
 ------------------------
-Client that connects to the camera service and displays all three cameras:
-world, eye0, and eye1 simultaneously.
+Simplified client that connects to the camera service and displays camera feeds:
+world, eye0, and eye1 simultaneously. Display only, no control functionality.
+Optimized for smooth display performance at ~30 FPS.
 """
-import os
 import time
 import json
 import logging
@@ -21,7 +21,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("MultiCameraDisplay")
+logger = logging.getLogger("SimpleCameraDisplay")
 
 class MessageType:
     """Message types for ZeroMQ communication."""
@@ -31,24 +31,28 @@ class MessageType:
     STATUS_UPDATE = 3
     ERROR = 4
 
-class MultiCameraDisplay:
+class SimpleCameraDisplay:
     """
     Video display for multiple cameras.
     Displays world, eye0, and eye1 cameras simultaneously.
-    Single-threaded implementation to avoid threading issues on macOS.
+    Display only, with no recording or control functionality.
+    Optimized for smooth display performance at ~30 FPS.
     """
     
-    def __init__(self, server_host="127.0.0.1", server_port=5555):
+    def __init__(self, server_host="127.0.0.1", server_port=5555, target_fps=30):
         """
-        Initialize the multi-camera video display.
+        Initialize the simple camera display.
         
         Args:
             server_host: Camera service host address
             server_port: Camera service command port
+            target_fps: Target frames per second for display
         """
         self.server_host = server_host
         self.server_port = server_port
-        self.client_id = f"multi_display_{uuid.uuid4().hex[:8]}"
+        self.client_id = f"simple_display_{uuid.uuid4().hex[:8]}"
+        self.target_fps = target_fps
+        self.target_frame_time = 1.0 / target_fps
         
         # List of cameras to display
         self.cameras = ["world", "eye0", "eye1"]
@@ -59,6 +63,11 @@ class MultiCameraDisplay:
             "eye0": None,
             "eye1": None
         }
+        
+        # Performance tracking
+        self.frame_count = 0
+        self.fps_stats = {cam: {"count": 0, "last_time": 0, "fps": 0} for cam in self.cameras}
+        self.last_display_time = time.monotonic()
         
         # Initialize ZeroMQ context
         self.context = zmq.Context()
@@ -72,21 +81,15 @@ class MultiCameraDisplay:
         self.sub_socket.connect(f"tcp://{server_host}:{server_port+1}")
         self.sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")  # Subscribe to all messages
         
-        # Set socket timeout for polling
-        self.sub_socket.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout
-        
-        # Status variables
-        self.is_connected = False
-        self.is_recording = False
-        self.recording_path = None
-        self.recording_duration = 0
-        self.camera_statuses = {}
+        # Set socket options for better performance
+        self.sub_socket.setsockopt(zmq.RCVTIMEO, 10)  # 10ms timeout
+        self.sub_socket.setsockopt(zmq.LINGER, 0)
         
         # Window names
         self.window_names = {
-            "world": "Camera: World",
-            "eye0": "Camera: Eye 0",
-            "eye1": "Camera: Eye 1"
+            "world": "World Camera",
+            "eye0": "Eye Camera 0",
+            "eye1": "Eye Camera 1"
         }
         
         # Control variables
@@ -98,12 +101,7 @@ class MultiCameraDisplay:
             # Send initial status request
             response = self.send_command("get_status")
             if response.get("status") == "ok":
-                self.is_connected = True
                 logger.info(f"Connected to camera service at {self.server_host}:{self.server_port}")
-                
-                # Update camera statuses
-                if "cameras" in response:
-                    self.camera_statuses = response["cameras"]
                 
                 # Start streaming for all cameras
                 success = True
@@ -192,11 +190,7 @@ class MultiCameraDisplay:
                 if camera_id == "world":
                     cv2.resizeWindow(window_name, 800, 450)
                 else:
-                    cv2.resizeWindow(window_name, 400, 300)
-            
-            # Create status window
-            cv2.namedWindow("Status", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("Status", 800, 100)
+                    cv2.resizeWindow(window_name, 300, 300)
             
             logger.info("Created OpenCV windows")
             return True
@@ -204,8 +198,59 @@ class MultiCameraDisplay:
             logger.error(f"Failed to create OpenCV windows: {e}")
             return False
     
+    def process_frame(self, metadata, frame_data):
+        """Process a single frame from the camera service."""
+        cam_id = metadata.get("camera_id")
+        
+        # Skip if not one of our cameras
+        if cam_id not in self.cameras:
+            return False
+        
+        # For eye cameras, we might want to skip some frames 
+        # when the rate is higher than our display needs
+        if cam_id.startswith("eye"):
+            # Assuming eye cameras run at 120fps and we want 30fps display
+            # We'll just take every 4th frame
+            self.fps_stats[cam_id]["count"] += 1
+            if self.fps_stats[cam_id]["count"] % 4 != 0:
+                return False
+        
+        try:
+            # Decode frame - lower quality for improved performance
+            img = cv2.imdecode(np.frombuffer(frame_data, np.uint8), cv2.IMREAD_COLOR)
+            
+            # Resize for eye cameras for better performance
+            if cam_id.startswith("eye"):
+                img = cv2.resize(img, (192, 192))  # Smaller size for eye cameras
+            
+            # Add timestamp text to image
+            timestamp = metadata.get("timestamp")
+            time_str = time.strftime("%H:%M:%S", time.localtime(timestamp))
+            time_str += f".{int((timestamp % 1) * 1000):03d}"
+            cv2.putText(img, time_str, (10, 20), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            
+            # Store current frame
+            self.current_frames[cam_id] = img
+            
+            # Display frame
+            cv2.imshow(self.window_names[cam_id], img)
+            
+            # Update FPS statistics for this camera
+            now = time.monotonic()
+            if self.fps_stats[cam_id]["last_time"] > 0:
+                elapsed = now - self.fps_stats[cam_id]["last_time"]
+                if elapsed > 0:
+                    self.fps_stats[cam_id]["fps"] = 1.0 / elapsed
+            self.fps_stats[cam_id]["last_time"] = now
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error processing frame for {cam_id}: {e}")
+            return False
+    
     def run(self):
-        """Run the main display loop."""
+        """Run the main display loop with optimized timing."""
         # Connect to service
         if not self.connect():
             logger.error("Failed to connect to camera service")
@@ -217,202 +262,107 @@ class MultiCameraDisplay:
             self.disconnect()
             return
         
-        logger.info("Starting display loop")
+        logger.info(f"Starting display loop with target {self.target_fps} FPS")
         self.running = True
+        self.last_display_time = time.monotonic()
+        self.frame_count = 0
+        fps_report_time = time.monotonic()
         
         try:
             # Main loop
             while self.running:
-                # Check for status updates and frames
-                try:
-                    # Receive message from sub socket
-                    message = self.sub_socket.recv_multipart(zmq.NOBLOCK)
-                    
-                    # Process message
-                    if len(message) == 1:
-                        # Status update (JSON)
-                        status = json.loads(message[0])
-                        if status.get("type") == MessageType.STATUS_UPDATE:
-                            self.update_status(status)
-                    
-                    elif len(message) == 2:
-                        # Frame data (metadata + binary)
-                        metadata = json.loads(message[0])
-                        frame_data = message[1]
-                        
-                        if metadata.get("type") == MessageType.FRAME_RESPONSE:
-                            cam_id = metadata.get("camera_id")
-                            
-                            # Process frames for any of our cameras
-                            if cam_id in self.cameras:
-                                # Decode frame
-                                img = cv2.imdecode(np.frombuffer(frame_data, np.uint8), cv2.IMREAD_COLOR)
-                                
-                                # Add timestamp
-                                timestamp = metadata.get("timestamp")
-                                self.add_timestamp(img, timestamp)
-                                
-                                # Store current frame
-                                self.current_frames[cam_id] = img
-                                
-                                # Display frame
-                                cv2.imshow(self.window_names[cam_id], img)
-                                
-                except zmq.Again:
-                    # No message available, continue
-                    pass
-                except Exception as e:
-                    logger.error(f"Error receiving message: {e}")
+                loop_start_time = time.monotonic()
+                frames_processed = 0
                 
-                # Update status display
-                self.display_status()
+                # Process up to 10 messages per frame to avoid getting stuck
+                # processing a backlog of messages
+                for _ in range(10):
+                    try:
+                        # Use NOBLOCK to avoid blocking in the loop
+                        message = self.sub_socket.recv_multipart(zmq.NOBLOCK)
+                        
+                        # Process message
+                        if len(message) == 2:
+                            # Frame data (metadata + binary)
+                            metadata = json.loads(message[0])
+                            frame_data = message[1]
+                            
+                            if metadata.get("type") == MessageType.FRAME_RESPONSE:
+                                # Process frame and increment counter if successful
+                                if self.process_frame(metadata, frame_data):
+                                    frames_processed += 1
+                        
+                    except zmq.Again:
+                        # No more messages available right now
+                        break
+                    except Exception as e:
+                        logger.error(f"Error receiving or processing message: {e}")
                 
                 # Process keyboard input
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
+                if key == ord('q') or key == 27:  # 'q' or ESC
                     logger.info("Quit requested")
                     self.running = False
-                elif key == ord('r'):
-                    self.toggle_recording()
                 
-                # Small sleep to prevent high CPU usage
-                time.sleep(0.01)
+                # Calculate how long to sleep to maintain target frame rate
+                current_time = time.monotonic()
+                elapsed = current_time - loop_start_time
+                sleep_time = max(0, self.target_frame_time - elapsed)
+                
+                # Log FPS every 5 seconds
+                if current_time - fps_report_time > 5.0:
+                    fps_report_time = current_time
+                    fps_msg = f"Display FPS: "
+                    for cam_id in self.cameras:
+                        fps_msg += f"{cam_id}={self.fps_stats[cam_id]['fps']:.1f} "
+                    logger.info(fps_msg)
+                
+                # Increment frame count
+                self.frame_count += 1
+                
+                if frames_processed > 0:
+                    # If we processed frames, sleep to maintain timing
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                else:
+                    # If no frames were processed, sleep a small amount to avoid CPU overuse
+                    time.sleep(0.005)
                 
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
         except Exception as e:
             logger.error(f"Error in main loop: {e}")
+            logger.exception(e)
         finally:
             # Clean up
             self.running = False
             self.disconnect()
             cv2.destroyAllWindows()
-    
-    def update_status(self, status):
-        """Update internal status from server status."""
-        if status.get("recording") is not None:
-            self.is_recording = status["recording"]
-        
-        # Update recording info if available
-        if "recording_info" in status:
-            self.recording_path = status["recording_info"].get("path")
-            self.recording_duration = status["recording_info"].get("duration", 0)
-        else:
-            self.recording_duration = 0
-            
-        # Update camera statuses
-        if "cameras" in status:
-            self.camera_statuses = status["cameras"]
-    
-    def add_timestamp(self, img, timestamp):
-        """Add timestamp to image."""
-        # Format timestamp as HH:MM:SS.mmm
-        time_str = time.strftime("%H:%M:%S", time.localtime(timestamp))
-        time_str += f".{int((timestamp % 1) * 1000):03d}"
-        
-        # Add text to image
-        cv2.putText(
-            img, time_str, (10, 30), 
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
-        )
-    
-    def display_status(self):
-        """Display status overlay with information for all cameras."""
-        try:
-            # Create status image
-            height, width = 100, 800
-            status_img = np.zeros((height, width, 3), dtype=np.uint8)
-            
-            # Add recording status
-            if self.is_recording:
-                # Red recording indicator
-                cv2.circle(status_img, (20, 20), 10, (0, 0, 255), -1)
-                
-                # Recording time
-                time_str = self.format_duration(self.recording_duration)
-                cv2.putText(
-                    status_img, f"REC {time_str}", (40, 25), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2
-                )
-                
-                # Recording path
-                if self.recording_path:
-                    path_str = f"Path: {os.path.basename(self.recording_path)}"
-                    cv2.putText(
-                        status_img, path_str, (40, 50), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
-                    )
-            else:
-                cv2.putText(
-                    status_img, "Press 'R' to start recording", (20, 25), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1
-                )
-            
-            # Add camera statuses
-            status_text = ""
-            for i, cam_id in enumerate(self.cameras):
-                # Get status for this camera
-                cam_status = self.camera_statuses.get(cam_id, {})
-                online = cam_status.get("online", False)
-                status_text += f" | {cam_id}: {'ONLINE' if online else 'OFFLINE'}"
-            
-            cv2.putText(
-                status_img, status_text, (20, 75), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
-            )
-            
-            # Add help text
-            cv2.putText(
-                status_img, "Q: Quit | R: Record", (600, 75), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1
-            )
-            
-            # Display status overlay
-            cv2.imshow("Status", status_img)
-        except Exception as e:
-            logger.error(f"Error displaying status: {e}")
-    
-    def toggle_recording(self):
-        """Toggle recording state."""
-        if self.is_recording:
-            logger.info("Stopping recording")
-            response = self.send_command("stop_recording")
-            if response.get("status") == "ok":
-                self.is_recording = False
-                path = response.get("path")
-                logger.info(f"Recording stopped: {path}")
-        else:
-            logger.info("Starting recording")
-            response = self.send_command("start_recording")
-            if response.get("status") == "ok":
-                self.is_recording = True
-                self.recording_path = response.get("path")
-                logger.info(f"Recording started: {self.recording_path}")
-    
-    def format_duration(self, seconds):
-        """Format duration as MM:SS.ms."""
-        minutes = int(seconds // 60)
-        seconds = seconds % 60
-        return f"{minutes:02d}:{seconds:05.2f}"
-
+            logger.info("Display stopped")
 
 def main():
     """Main entry point."""
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Multi-Camera Video Display Client")
+    parser = argparse.ArgumentParser(description="Simple Camera Display Client")
     parser.add_argument("--host", default="127.0.0.1", help="Camera service host address")
     parser.add_argument("--port", type=int, default=5555, help="Camera service port")
+    parser.add_argument("--fps", type=int, default=30, help="Target display frames per second")
     args = parser.parse_args()
     
+    # Print instructions
+    print("Simple Camera Display")
+    print("--------------------")
+    print("Press 'q' or ESC to quit")
+    
     # Create and run display
-    display = MultiCameraDisplay(
+    display = SimpleCameraDisplay(
         server_host=args.host,
-        server_port=args.port
+        server_port=args.port,
+        target_fps=args.fps
     )
     
     # Run the display
     display.run()
-
 
 if __name__ == "__main__":
     main()
