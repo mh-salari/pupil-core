@@ -535,7 +535,8 @@ def find_camera_by_uid(uid):
 
 
 def create_camera_manager(world_name="ID2", eye0_name="ID0", eye1_name="ID1", 
-                         exposure_mode="auto",
+                         world_exposure_mode="auto",  # Separate exposure mode for world camera
+                         eye_exposure_mode="manual",  # Separate exposure mode for eye cameras
                          world_size=(1280, 720), world_fps=30, 
                          eye_size=(192, 192), eye_fps=120):
     """
@@ -545,7 +546,8 @@ def create_camera_manager(world_name="ID2", eye0_name="ID0", eye1_name="ID1",
         world_name: Name pattern for world camera
         eye0_name: Name pattern for eye0 camera
         eye1_name: Name pattern for eye1 camera
-        exposure_mode: "auto" or "manual" exposure control
+        world_exposure_mode: "auto" or "manual" exposure control for world camera
+        eye_exposure_mode: "auto" or "manual" exposure control for eye cameras
         world_size: Frame size for world camera
         world_fps: Frame rate for world camera
         eye_size: Frame size for eye cameras
@@ -554,10 +556,15 @@ def create_camera_manager(world_name="ID2", eye0_name="ID0", eye1_name="ID1",
     Returns:
         Dict with cameras
     """
-    # Initialize cameras
-    world_cam = UVCSource(name=world_name, frame_size=world_size, frame_rate=world_fps, exposure_mode=exposure_mode)
-    eye0_cam = UVCSource(name=eye0_name, frame_size=eye_size, frame_rate=eye_fps, exposure_mode=exposure_mode)
-    eye1_cam = UVCSource(name=eye1_name, frame_size=eye_size, frame_rate=eye_fps, exposure_mode=exposure_mode)
+    # Initialize cameras with different exposure modes
+    world_cam = UVCSource(name=world_name, frame_size=world_size, frame_rate=world_fps, 
+                          exposure_mode=world_exposure_mode)
+    
+    eye0_cam = UVCSource(name=eye0_name, frame_size=eye_size, frame_rate=eye_fps, 
+                         exposure_mode=eye_exposure_mode)
+    
+    eye1_cam = UVCSource(name=eye1_name, frame_size=eye_size, frame_rate=eye_fps, 
+                         exposure_mode=eye_exposure_mode)
     
     # Collect a few frames to stabilize cameras
     for _ in range(10):
