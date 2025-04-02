@@ -568,8 +568,17 @@ class CameraService:
     def publish_frame(self, cam_id, frame):
         """Publish a frame to clients."""
         try:
-            # Convert frame to JPEG-encoded bytes
-            _, img_encoded = cv2.imencode(".jpg", frame.img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            # Get image from frame
+            img = frame.img.copy()
+            
+            # Rotate eye0 camera image (it's upside down)
+            if cam_id == "eye0":
+                img = cv2.rotate(img, cv2.ROTATE_180)
+            
+            # Convert frame to JPEG-encoded bytes with highest quality for detection
+            # Eye cameras need higher quality for accurate pupil detection
+            jpeg_quality = 95 if cam_id.startswith("eye") else 90
+            _, img_encoded = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
             img_bytes = img_encoded.tobytes()
             
             # Create frame metadata

@@ -15,7 +15,7 @@ import numpy as np
 
 from ..service.message_types import MessageType
 from ..utils.timestamp import format_time
-from ..detection.pupil_detector import PupilDetector
+from ..detection.pupil_detector_client import PupilDetectorClient
 
 # Configure logging
 logging.basicConfig(
@@ -81,10 +81,19 @@ class VideoDisplay:
         self.sub_socket.setsockopt(zmq.RCVTIMEO, 10)  # 10ms timeout
         self.sub_socket.setsockopt(zmq.LINGER, 0)
         
-        # Initialize pupil detector if needed
-        self.pupil_detector = None
+        # Try to connect to the pupil detector service
+        self.pupil_client = None
+        self.detector_available = False
         if show_pupils:
-            self.pupil_detector = PupilDetector(server_host, server_port)
+            try:
+                self.pupil_client = PupilDetectorClient(server_host, server_port)
+                if self.pupil_client.is_detector_running():
+                    self.detector_available = True
+                    logger.info("Connected to pupil detector service")
+                else:
+                    logger.info("Pupil detector service is not running, pupil visualization disabled")
+            except Exception as e:
+                logger.warning(f"Failed to connect to pupil detector service: {e}")
         
         # Window names
         self.window_names = {
@@ -132,6 +141,10 @@ class VideoDisplay:
             
             # Send disconnect command
             self.send_command("disconnect")
+            
+            # Disconnect from pupil detector if connected
+            if self.pupil_client:
+                self.pupil_client.disconnect()
             
             # Close ZeroMQ sockets
             self.command_socket.close()
@@ -233,8 +246,8 @@ class VideoDisplay:
             # Store current frame
             self.current_frames[cam_id] = img
             
-            # Overlay pupil detection if enabled
-            if self.show_pupils and self.pupil_detector and self.pupil_detector.is_detecting():
+            # Overlay pupil detection if enabled and detector is available
+            if self.show_pupils and self.detector_available and self.pupil_client:
                 self._overlay_pupil_detection(cam_id, img)
             
             # Display frame
@@ -260,8 +273,8 @@ class VideoDisplay:
             if not cam_id.startswith("eye"):
                 return
             
-            # Get pupil positions
-            pupil_data = self.pupil_detector.get_pupil_positions()
+            # Get pupil positions from the detector client
+            pupil_data = self.pupil_client.get_pupil_positions()
             
             # Get the detection for this specific camera
             detection = pupil_data.get(cam_id)
@@ -270,9 +283,24 @@ class VideoDisplay:
                 center = detection["center"]
                 radius = detection["radius"]
                 confidence = detection.get("confidence", 0)
+                ellipse_data = detection.get("ellipse")
                 
-                # Draw pupil circle
-                cv2.circle(img, center, radius, (0, 255, 0), 2)
+                # Draw pupil
+                if ellipse_data and all(k in ellipse_data for k in ["center", "axes", "angle"]):
+                    # Draw ellipse if available (more accurate representation)
+                    cv2.ellipse(
+                        img, 
+                        ellipse_data["center"], 
+                        ellipse_data["axes"], 
+                        ellipse_data["angle"], 
+                        0, 360,  # Start/end angle
+                        (0, 255, 0), 2  # Color (green), thickness
+                    )
+                else:
+                    # Fall back to circle if ellipse data not available
+                    cv2.circle(img, center, radius, (0, 255, 0), 2)
+                
+                # Draw center point
                 cv2.circle(img, center, 2, (0, 0, 255), -1)  # Center point
                 
                 # Add confidence text
@@ -314,10 +342,6 @@ class VideoDisplay:
             logger.error("Failed to create windows, cannot continue")
             self.disconnect()
             return
-        
-        # Start pupil detector if enabled
-        if self.show_pupils and self.pupil_detector:
-            self.pupil_detector.start(show_visualization=False)
         
         logger.info(f"Starting display loop with target {self.target_fps} FPS")
         self.running = True
@@ -396,8 +420,6 @@ class VideoDisplay:
         finally:
             # Clean up
             self.running = False
-            if self.pupil_detector:
-                self.pupil_detector.stop()
             self.disconnect()
             cv2.destroyAllWindows()
             logger.info("Display stopped")

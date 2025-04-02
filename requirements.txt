@@ -1,0 +1,14 @@
+# Python version requirement
+# Python 3.11 is required for compatibility with pupil-detectors
+# Python 3.12 is not supported by pupil-detectors
+
+# Core dependencies
+numpy==2.2.4
+opencv-python==4.11.0.86
+pyzmq==26.3.0
+av==14.2.0
+
+# Pupil detection
+pupil-detectors==2.0.2
+pupil-labs-uvc==1.0.0b7
+

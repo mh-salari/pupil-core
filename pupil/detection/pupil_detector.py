@@ -13,6 +13,7 @@ import numpy as np
 import zmq
 
 from ..service.message_types import MessageType
+from .pupil_detector_algorithm import detect_pupil
 
 # Configure logging
 logging.basicConfig(
@@ -28,17 +29,19 @@ class PupilDetector:
     receives eye camera frames, and performs pupil detection.
     """
     
-    def __init__(self, server_host="127.0.0.1", server_port=5555):
+    def __init__(self, server_host="127.0.0.1", server_port=5555, enable_client_server=True):
         """
         Initialize the pupil detector.
         
         Args:
             server_host: Camera service host address
             server_port: Camera service command port
+            enable_client_server: Whether to enable client-server functionality
         """
         self.server_host = server_host
         self.server_port = server_port
         self.client_id = f"pupil_detector_{uuid.uuid4().hex[:8]}"
+        self.enable_client_server = enable_client_server
         
         # Detection parameters
         self.min_pupil_radius = 10
@@ -63,6 +66,9 @@ class PupilDetector:
         self.threads = []
         self.result_lock = threading.Lock()
         
+        # Client-server functionality
+        self.clients = {}
+        
         # Connect to ZeroMQ
         self._init_zeromq()
     
@@ -83,6 +89,16 @@ class PupilDetector:
         # Set socket options for better performance
         self.sub_socket.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout
         self.sub_socket.setsockopt(zmq.LINGER, 0)
+        
+        # Create client-server socket if enabled
+        self.client_socket = None
+        if self.enable_client_server:
+            # Create socket for client connections (REP)
+            self.client_socket = self.context.socket(zmq.REP)
+            client_port = self.server_port + 2  # Use port + 2 for client connections
+            self.client_socket.bind(f"tcp://*:{client_port}")
+            self.client_socket.setsockopt(zmq.RCVTIMEO, 10)  # 10ms timeout
+            logger.info(f"Pupil detector client server listening on port {client_port}")
     
     def start(self, show_visualization=False):
         """
@@ -134,6 +150,8 @@ class PupilDetector:
         # Close ZeroMQ sockets
         self.command_socket.close()
         self.sub_socket.close()
+        if self.client_socket:
+            self.client_socket.close()
         self.context.term()
         
         # Close visualization windows
@@ -141,6 +159,84 @@ class PupilDetector:
             cv2.destroyAllWindows()
         
         logger.info("Pupil detector stopped")
+        
+    def _handle_client_request(self):
+        """Handle client requests for pupil data."""
+        if not self.client_socket:
+            return False
+            
+        try:
+            # Try to receive a message non-blockingly
+            message_json = self.client_socket.recv_json(zmq.NOBLOCK)
+            
+            # Process the request
+            if not isinstance(message_json, dict):
+                self.client_socket.send_json({"status": "error", "message": "Invalid request format"})
+                return True
+            
+            # Get command from message
+            command = message_json.get("command")
+            client_id = message_json.get("client_id", "unknown")
+            
+            # Handle commands
+            if command == "get_pupil_positions":
+                # Return current pupil positions
+                response = {
+                    "status": "ok",
+                    "data": self.get_pupil_positions(),
+                    "timestamp": time.time()
+                }
+                self.client_socket.send_json(response)
+                
+            elif command == "get_pupil_status":
+                # Return detector status
+                response = {
+                    "status": "ok",
+                    "is_detecting": self.is_detecting(),
+                    "timestamp": time.time()
+                }
+                self.client_socket.send_json(response)
+                
+            elif command == "disconnect":
+                # Client is disconnecting
+                if client_id in self.clients:
+                    del self.clients[client_id]
+                response = {
+                    "status": "ok",
+                    "message": "Disconnected",
+                    "timestamp": time.time()
+                }
+                self.client_socket.send_json(response)
+                
+            else:
+                # Unknown command
+                response = {
+                    "status": "error",
+                    "message": f"Unknown command: {command}",
+                    "timestamp": time.time()
+                }
+                self.client_socket.send_json(response)
+            
+            # Store client info
+            self.clients[client_id] = {"last_active": time.time()}
+            
+            return True
+            
+        except zmq.Again:
+            # No message available
+            return False
+        except Exception as e:
+            logger.error(f"Error handling client request: {e}")
+            try:
+                # Try to send error response
+                self.client_socket.send_json({
+                    "status": "error",
+                    "message": f"Server error: {str(e)}",
+                    "timestamp": time.time()
+                })
+            except:
+                pass
+            return True
     
     def _send_command(self, command, params=None):
         """
@@ -205,8 +301,12 @@ class PupilDetector:
                                 frame_data = message[1]
                                 img = cv2.imdecode(np.frombuffer(frame_data, np.uint8), cv2.IMREAD_GRAYSCALE)
                                 
-                                # Detect pupil
-                                result = self._detect_pupil(img)
+                                # Detect pupil using the standalone algorithm
+                                result = detect_pupil(
+                                    img, 
+                                    min_pupil_radius=self.min_pupil_radius, 
+                                    max_pupil_radius=self.max_pupil_radius
+                                )
                                 
                                 # Visualize if enabled
                                 if self.show_visualization and img is not None and result is not None:
@@ -249,6 +349,10 @@ class PupilDetector:
                     self.running = False
                     break
                 
+                # Handle client requests if client server is enabled
+                if self.enable_client_server and self.client_socket:
+                    self._handle_client_request()
+                
                 # Sleep a small amount to avoid busy waiting
                 time.sleep(0.001)
                 
@@ -257,100 +361,6 @@ class PupilDetector:
             logger.exception(e)
             self.running = False
     
-    def _detect_pupil(self, image):
-        """
-        Enhanced pupil detection in grayscale eye image.
-        
-        Args:
-            image: Grayscale eye image
-            
-        Returns:
-            Dictionary with pupil properties or None if not detected
-        """
-        try:
-            if image is None or image.size == 0:
-                return None
-            
-            # Apply multiple preprocessing steps
-            # 1. Reduce noise with a gentle blur
-            blurred = cv2.GaussianBlur(image, (5, 5), 0)
-            
-            # 2. Adaptive thresholding to handle varying lighting conditions
-            adaptive_thresh = cv2.adaptiveThreshold(
-                blurred, 
-                255, 
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                cv2.THRESH_BINARY_INV, 
-                11,  # Block size 
-                2    # Constant subtracted from mean
-            )
-            
-            # 3. Morphological operations to clean up the image
-            kernel = np.ones((3,3), np.uint8)
-            cleaned = cv2.morphologyEx(adaptive_thresh, cv2.MORPH_CLOSE, kernel)
-            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
-            
-            # Find contours
-            contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Filter and select the best pupil candidate
-            pupil_candidates = []
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                
-                # Skip very small or very large contours
-                if area < 50 or area > image.size * 0.4:
-                    continue
-                
-                # Compute contour properties
-                (x, y), radius = cv2.minEnclosingCircle(contour)
-                circularity = 4 * np.pi * area / (cv2.arcLength(contour, True) ** 2)
-                
-                # Validate radius and circularity
-                if (self.min_pupil_radius <= radius <= self.max_pupil_radius) and circularity > 0.7:
-                    pupil_candidates.append({
-                        'contour': contour,
-                        'area': area,
-                        'circularity': circularity
-                    })
-            
-            # If no candidates, return None
-            if not pupil_candidates:
-                return None
-            
-            # Select the best candidate (prioritizing area and circularity)
-            best_candidate = max(pupil_candidates, key=lambda x: (x['area'], x['circularity']))
-            
-            # Compute final pupil properties
-            contour = best_candidate['contour']
-            (x, y), radius = cv2.minEnclosingCircle(contour)
-            center = (int(x), int(y))
-            radius = int(radius)
-            
-            # Compute area and circularity of the selected contour
-            area = cv2.contourArea(contour)
-            circularity = 4 * np.pi * area / (cv2.arcLength(contour, True) ** 2)
-            
-            # Calculate confidence based on area, circularity, and size
-            confidence = (
-                (area / (np.pi * radius**2)) *  # Fullness of circle
-                circularity *  # Regularity of shape
-                (1 - min(abs(radius - (self.min_pupil_radius + self.max_pupil_radius)/2) / 
-                        ((self.max_pupil_radius - self.min_pupil_radius)/2), 1))  # Size proximity
-            ) * 100  # Scale to percentage
-            
-            # Return detection result
-            return {
-                "center": center,
-                "radius": radius,
-                "confidence": confidence,
-                "timestamp": time.time()
-            }
-            
-        except Exception as e:
-            logger.error(f"Error in enhanced pupil detection: {e}")
-            return None
-
     def _visualize_detection(self, camera_id, image, detection):
         """
         Visualize pupil detection.
@@ -364,15 +374,29 @@ class PupilDetector:
             # Convert grayscale to BGR for colored annotations
             display_img = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
             
-            # Draw pupil circle
+            # Get detection info
             center = detection.get("center")
             radius = detection.get("radius")
             confidence = detection.get("confidence", 0)
+            ellipse_data = detection.get("ellipse")
             
             if center and radius:
-                # Draw circle
-                cv2.circle(display_img, center, radius, (0, 255, 0), 2)
-                cv2.circle(display_img, center, 2, (0, 0, 255), -1)  # Center point
+                if ellipse_data and all(k in ellipse_data for k in ["center", "axes", "angle"]):
+                    # Draw ellipse if available
+                    cv2.ellipse(
+                        display_img, 
+                        ellipse_data["center"], 
+                        ellipse_data["axes"], 
+                        ellipse_data["angle"], 
+                        0, 360,  # Start/end angle
+                        (0, 255, 0), 2  # Color (green), thickness
+                    )
+                else:
+                    # Fall back to circle if ellipse data not available
+                    cv2.circle(display_img, center, radius, (0, 255, 0), 2)
+                
+                # Draw center point
+                cv2.circle(display_img, center, 2, (0, 0, 255), -1)  # Center point (red)
                 
                 # Add text with confidence
                 conf_text = f"Conf: {confidence:.1f}%"

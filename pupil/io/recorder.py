@@ -9,9 +9,11 @@ import logging
 import uuid
 import json
 import threading
+import copy
 from pathlib import Path
 
 import numpy as np
+import cv2
 
 from .video_writer import MPEGWriter, JPEGWriter, H264Writer
 
@@ -147,7 +149,11 @@ class Recorder:
             
             # Write eye frames
             if eye0_frame and "eye0" in self.eye_writers:
-                if self.eye_writers["eye0"].write_frame(eye0_frame):
+                # Rotate eye0 camera image (it's upside down)
+                eye0_frame_copy = copy.copy(eye0_frame)
+                eye0_frame_copy.img = cv2.rotate(eye0_frame.img, cv2.ROTATE_180)
+                
+                if self.eye_writers["eye0"].write_frame(eye0_frame_copy):
                     self.frame_counts["eye0"] += 1
             
             if eye1_frame and "eye1" in self.eye_writers:
